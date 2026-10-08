@@ -29,9 +29,9 @@ if HERE not in sys.path:
 
 import gbt  # noqa: E402
 
-CFG_PATH = os.path.join(HERE, "sweep_gui.json")
-PAIRS_CACHE = os.path.join(HERE, "pairs_cache.json")
-STOP_FILE = os.path.join(HERE, ".gbt_stop")   # кнопка «Стоп»: gbt.py видит файл и дописывает текущие прогоны
+CFG_PATH = os.path.join(gbt.CONFIGS_DIR, "sweep_gui.json")   # конфиг, с которым окно запускает прогон
+PAIRS_CACHE = os.path.join(gbt.DATA_DIR, "pairs_cache.json")
+STOP_FILE = os.path.join(gbt.DATA_DIR, ".gbt_stop")   # кнопка «Стоп»: gbt.py видит файл и дописывает текущие прогоны
 
 # цвета и шрифт сайта (style.css, светлая тема)
 BG, PANEL, LINE = "#f6f7f9", "#ffffff", "#e2e6ea"
@@ -930,7 +930,7 @@ class App:
         self.output = self._var("results.csv")
         self.entry_hold = self._var("60")
         self.extra_periods = self._var("")
-        line("Файл результатов (CSV)", self.output)
+        line("Файл результатов (CSV, в папке results)", self.output)
         line("Параллельных запросов", self.workers)
         line("Прогонов в минуту (сервер: 20)", self.rate_min)
         line("Прогонов в час (сервер: 150)", self.rate_hour)
@@ -958,7 +958,8 @@ class App:
         r.pack(fill="x")
         ghost(r, "Сохранить…", self.save_cfg).box.pack(side="left")
         ghost(r, "Загрузить…", self.load_cfg).box.pack(side="left", padx=6)
-        ghost(r, "Открыть sweep_gui.json", lambda: self._open(CFG_PATH)).box.pack(side="left")
+        ghost(r, "Папка configs", lambda: self._open(gbt.CONFIGS_DIR)).box.pack(side="left")
+        ghost(r, "Папка results", lambda: self._open(gbt.RESULTS_DIR)).box.pack(side="left", padx=6)
         primary(w, "Готово", self._hide_advanced).pack(fill="x", pady=(14, 0))
 
     def show_advanced(self):
@@ -1090,6 +1091,7 @@ class App:
             err = e
         if data:
             try:
+                os.makedirs(gbt.DATA_DIR, exist_ok=True)
                 with open(PAIRS_CACHE, "w", encoding="utf-8") as f:
                     json.dump(data, f, ensure_ascii=False)
             except OSError:
@@ -1295,7 +1297,8 @@ class App:
                 "rate_per_hour": self._pos_int(self.rate_hour, "Прогонов в час"),
                 "output": self.output.get().strip() or "results.csv",
             }
-            folder = os.path.dirname(os.path.join(HERE, cfg["output"]))
+            os.makedirs(gbt.RESULTS_DIR, exist_ok=True)
+            folder = os.path.dirname(gbt.results_path(cfg["output"]))
             if not os.path.isdir(folder):
                 raise ValueError("Файл результатов: папки «%s» нет" % folder)
             stops = self._row_values("stop_loss")
@@ -1323,7 +1326,7 @@ class App:
 
     @staticmethod
     def _out_path(cfg):
-        return os.path.join(HERE, cfg["output"])
+        return gbt.results_path(cfg["output"])
 
     def _done_pairs(self, path):
         """gbt.done_pairs с кэшем по времени изменения файла."""
@@ -1486,22 +1489,23 @@ class App:
         elif force:
             self.say("Файла %s ещё нет — считаю с начала." % cfg["output"])
         try:
+            os.makedirs(gbt.CONFIGS_DIR, exist_ok=True)
             with open(CFG_PATH, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=1)
         except OSError as e:
             messagebox.showerror("Конфиг", "Не записал %s: %s" % (CFG_PATH, e))
             return
-        self.run_cmd(["sweep", os.path.basename(CFG_PATH)])
+        self.run_cmd(["sweep", os.path.relpath(CFG_PATH, HERE).replace("\\", "/")])
 
     def show_top(self):
-        out = os.path.join(HERE, self.output.get().strip() or "results.csv")
+        out = gbt.results_path(self.output.get().strip() or "results.csv")
         if not os.path.exists(out):
             self.say("Файла %s ещё нет — сначала запустите прогон." % os.path.basename(out))
             return
         Results(self.root, out)
 
     def open_csv(self):
-        out = os.path.join(HERE, self.output.get().strip() or "results.csv")
+        out = gbt.results_path(self.output.get().strip() or "results.csv")
         if os.path.exists(out):
             self._open(out)
         else:
@@ -1522,7 +1526,7 @@ class App:
         if err:
             messagebox.showerror("Настройки", err)
             return
-        path = filedialog.asksaveasfilename(initialdir=HERE, initialfile="sweep_gui.json",
+        path = filedialog.asksaveasfilename(initialdir=gbt.CONFIGS_DIR, initialfile="sweep_my.json",
                                              defaultextension=".json",
                                              filetypes=[("JSON", "*.json")])
         if not path:
@@ -1536,7 +1540,7 @@ class App:
         self.say("Конфиг записан: %s" % path, "ok")
 
     def load_cfg(self):
-        path = filedialog.askopenfilename(initialdir=HERE, filetypes=[("JSON", "*.json")])
+        path = filedialog.askopenfilename(initialdir=gbt.CONFIGS_DIR, filetypes=[("JSON", "*.json")])
         if not path:
             return
         try:
@@ -1756,6 +1760,7 @@ def console_python():
 
 
 def main():
+    gbt.migrate_layout()   # файлы прежних версий из корня — по папкам configs, results, data
     # gui.bat запускает окно через pythonw — консоли нет, поэтому ошибки показываем в окне
     try:
         root = tk.Tk()

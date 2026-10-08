@@ -1,6 +1,8 @@
 """Разбор результатов: фронт Парето «итог % ↔ просадка %» и лучшие по отношению итог/просадка.
 
   python analyze.py results.csv [results_indicators.csv ...]
+
+Файлы ищутся как указаны, а если их нет — в папке results.
 """
 import csv
 import os
@@ -15,8 +17,13 @@ from gbt import entry_name  # noqa: E402
 if len(sys.argv) < 2:
     print(__doc__)
     sys.exit(1)
+gbt.migrate_layout()
 rows = []
 for path in sys.argv[1:]:
+    if not os.path.exists(path):
+        path = gbt.results_path(path)
+    if not os.path.exists(path):
+        sys.exit("Файла %s нет (ни здесь, ни в папке results)" % path)
     with open(path, encoding="utf-8-sig", newline="") as f:
         rows += [r for r in csv.DictReader(f) if not r.get("error")]
 for r in rows:

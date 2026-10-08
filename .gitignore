@@ -1,17 +1,21 @@
-# авторизация на gridbacktest.com (куки входа через Telegram) — не публиковать
-session.json
+# data/ — служебное: вход на gridbacktest.com (session.json — не публиковать),
+# счёт лимита сервера, кэш пар, флаг «Стоп»
+data/
 
-# служебное: счётчик лимита, флаг «Стоп», конфиг, который GUI пишет при каждом запуске
-rate.json
-rate.json.tmp
-rate.json.lock
-.gbt_stop
-sweep_gui.json
-pairs_cache.json
+# results/ — результаты прогонов, у каждого свои
+results/
 
-# результаты прогонов — у каждого свои
-results*.csv
-results*.jsonl
+# конфиг, который окно перезаписывает при каждом запуске
+configs/sweep_gui.json
+
+# файлы прежних версий в корне (программа сама переносит их по папкам)
+/session.json
+/rate.json*
+/pairs_cache.json
+/.gbt_stop
+/sweep_gui.json
+/results*.csv
+/results*.jsonl
 
 __pycache__/
 *.pyc

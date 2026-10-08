@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """Массовый прогон бэктестов gridbacktest.com.
 
-  python gbt.py login                    вход через Telegram, сессия -> session.json
+  python gbt.py login                    вход через Telegram, сессия -> data/session.json
   python gbt.py me                       кто вошёл и открыты ли итоги
   python gbt.py info                     пары, связки входа, лимиты параметров
-  python gbt.py sweep sweep.json         прогнать все комбинации из конфига
+  python gbt.py sweep sweep.json         прогнать все комбинации из конфига (configs/sweep.json)
   python gbt.py sweep sweep.json --dry-run   только посчитать число прогонов
-  python gbt.py top results.csv          лучшие результаты
+  python gbt.py top results.csv          лучшие результаты (results/results.csv)
 
 Прогон можно прервать (Ctrl+C) и запустить снова той же командой —
 уже посчитанные комбинации пропускаются.
+
+Папки: configs/ — настройки, results/ — результаты, data/ — вход, счёт лимита и кэш.
 """
 
 import argparse
@@ -31,7 +33,54 @@ import requests
 BASE = "https://gridbacktest.com"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) gbt-sweep/1.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
-SESSION_FILE = os.path.join(HERE, "session.json")
+# по папкам, а не в корне рядом с кодом
+CONFIGS_DIR = os.path.join(HERE, "configs")    # настройки прогонов (sweep*.json, конфиг окна)
+RESULTS_DIR = os.path.join(HERE, "results")    # результаты: *.csv и *.jsonl
+DATA_DIR = os.path.join(HERE, "data")          # служебное: вход, счёт лимита, кэш пар
+SESSION_FILE = os.path.join(DATA_DIR, "session.json")
+DATA_FILES = ("session.json", "rate.json", "pairs_cache.json")
+
+
+def migrate_layout():
+    """Файлы прежних версий из корня — по папкам. Существующие в папках не затираются."""
+    for d in (CONFIGS_DIR, RESULTS_DIR, DATA_DIR):
+        os.makedirs(d, exist_ok=True)
+    for name in os.listdir(HERE):
+        src = os.path.join(HERE, name)
+        if not os.path.isfile(src):
+            continue
+        if name in ("rate.json.lock", "rate.json.tmp", ".gbt_stop"):
+            try:
+                os.remove(src)
+            except OSError:
+                pass
+            continue
+        if name in DATA_FILES:
+            dest = DATA_DIR
+        elif name.endswith(".json"):
+            dest = CONFIGS_DIR
+        elif name.endswith((".csv", ".jsonl")):
+            dest = RESULTS_DIR
+        else:
+            continue
+        if not os.path.exists(os.path.join(dest, name)):
+            try:
+                os.replace(src, os.path.join(dest, name))
+            except OSError:
+                pass
+
+
+def config_path(path):
+    """Конфиг: как указан, а если такого файла нет — из папки configs."""
+    if os.path.exists(path) or os.path.isabs(path):
+        return path
+    alt = os.path.join(CONFIGS_DIR, path)
+    return alt if os.path.exists(alt) else path
+
+
+def results_path(name):
+    """Файл результатов: относительный путь — внутри папки results."""
+    return name if os.path.isabs(name) else os.path.join(RESULTS_DIR, name)
 
 PARAM_KEYS = ["deposit", "leverage", "orders", "price_overlap", "price_factor",
               "volume_factor", "profit", "reinvest"]
@@ -63,6 +112,7 @@ def new_session():
 def save_session(s):
     jar = [{"name": c.name, "value": c.value, "domain": c.domain, "path": c.path,
             "expires": c.expires, "secure": c.secure} for c in s.cookies]
+    os.makedirs(DATA_DIR, exist_ok=True)
     with open(SESSION_FILE, "w", encoding="utf-8") as f:
         json.dump(jar, f, indent=1)
 
@@ -664,7 +714,7 @@ ALLOW_LOCKED = False   # --force: считать и с закрытыми ито
 STOP = threading.Event()   # остановка прогона: Ctrl+C или кнопка «Стоп» в GUI (файл GBT_STOP_FILE)
 
 
-RATE_FILE = os.path.join(HERE, "rate.json")
+RATE_FILE = os.path.join(DATA_DIR, "rate.json")
 
 
 class FileLock:
@@ -674,6 +724,7 @@ class FileLock:
         self.path = path
 
     def __enter__(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
         self.f = open(self.path, "a+b")
         while True:
             try:
@@ -897,13 +948,14 @@ def upgrade_csv(path):
 
 
 def cmd_sweep(args):
+    args.config = config_path(args.config)
     with open(args.config, encoding="utf-8") as f:
         cfg = json.load(f)
     s = load_session()
     data = get_data(s)
     jobs = build_jobs(cfg, data)
-    out_csv = args.out or os.path.join(os.path.dirname(os.path.abspath(args.config)),
-                                       cfg.get("output", "results.csv"))
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    out_csv = results_path(args.out or cfg.get("output", "results.csv"))
     out_jsonl = os.path.splitext(out_csv)[0] + ".jsonl"
     if not os.path.isdir(os.path.dirname(os.path.abspath(out_csv))):
         sys.exit("Папки для файла результатов нет: %s" % os.path.dirname(os.path.abspath(out_csv)))
@@ -1165,6 +1217,8 @@ def show_top(path, limit, allow_liq=False, by="net_pct"):
 
 def cmd_top(args):
     if not os.path.exists(args.file):
+        args.file = results_path(args.file)
+    if not os.path.exists(args.file):
         sys.exit("Файла %s ещё нет — сначала запустите прогон." % args.file)
     show_top(args.file, args.n, args.with_liq, args.by)
 
@@ -1195,19 +1249,22 @@ def ask(prompt, default=""):
 
 
 def ask_config(default="sweep.json"):
+    found = sorted(f for f in os.listdir(CONFIGS_DIR) if f.endswith(".json"))
+    if found:
+        print("  в папке configs: " + ", ".join(found))
     cfg = ask("Конфиг", default)
-    path = os.path.join(HERE, cfg)
+    path = config_path(cfg)
     if not os.path.exists(path):
         print("Файл %s не найден, беру %s" % (cfg, default))
-        path = os.path.join(HERE, default)
+        path = os.path.join(CONFIGS_DIR, default)
     return path
 
 
 def ask_results():
-    found = sorted(f for f in os.listdir(HERE) if f.endswith(".csv"))
+    found = sorted(f for f in os.listdir(RESULTS_DIR) if f.endswith(".csv"))
     if found:
-        print("  есть: " + ", ".join(found))
-    return os.path.join(HERE, ask("Файл", found[0] if len(found) == 1 else "results.csv"))
+        print("  в папке results: " + ", ".join(found))
+    return results_path(ask("Файл", found[0] if len(found) == 1 else "results.csv"))
 
 
 def sweep_args(config, **kw):
@@ -1225,7 +1282,7 @@ def menu_action(ch):
     elif ch == "4":
         cmd_sweep(sweep_args(ask_config(), dry_run=True))
     elif ch == "5":
-        cmd_sweep(sweep_args(os.path.join(HERE, "sweep_test.json")))
+        cmd_sweep(sweep_args(os.path.join(CONFIGS_DIR, "sweep_test.json")))
     elif ch in ("6", "7"):
         cmd_sweep(sweep_args(ask_config("sweep.json" if ch == "6" else "sweep_indicators.json")))
     elif ch == "8":
@@ -1280,6 +1337,7 @@ def cmd_menu(_args):
 
 
 def main():
+    migrate_layout()
     ap = argparse.ArgumentParser(description="Массовые бэктесты gridbacktest.com")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("menu", help="интерактивное меню").set_defaults(fn=cmd_menu)
@@ -1294,7 +1352,7 @@ def main():
     p.add_argument("--force", action="store_true", help="считать, даже если итоги закрыты")
     p.set_defaults(fn=cmd_sweep)
     p = sub.add_parser("top", help="лучшие результаты из CSV")
-    p.add_argument("file", nargs="?", default=os.path.join(HERE, "results.csv"))
+    p.add_argument("file", nargs="?", default=results_path("results.csv"))
     p.add_argument("-n", type=int, default=30)
     p.add_argument("--by", default="net_pct", choices=["net_pct", "net", "max_drawdown"])
     p.add_argument("--with-liq", action="store_true", help="включать ликвидированные")
