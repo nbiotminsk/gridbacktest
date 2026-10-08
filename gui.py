@@ -10,6 +10,7 @@
 строки пишутся в CSV сразу, остановка безопасна, повторный запуск продолжает с места.
 """
 
+import csv
 import json
 import os
 import queue
@@ -383,6 +384,106 @@ class Picker(tk.Toplevel):
         self.destroy()
 
 
+class Results(tk.Toplevel):
+    """Таблица результатов из CSV: сортировка по клику на заголовок, ликвидации по флажку."""
+
+    COLS = [("symbol", "Пара", 90), ("position", "Сторона", 62), ("price_overlap", "Перекр., %", 78),
+            ("orders", "Ордеров", 66), ("price_factor", "Коэф. цены", 88),
+            ("volume_factor", "Коэф. объёма", 100), ("profit", "Тейк, %", 60), ("leverage", "Плечо", 52),
+            ("reinvest", "Реинв., %", 66), ("net_pct", "Итог, %", 80),
+            ("max_drawdown", "Просадка, %", 86), ("entries", "Сделок", 60),
+            ("entry", "Вход", 210), ("liq_time", "Ликвидация", 120)]
+    TEXT_COLS = {"symbol", "position", "entry", "liq_time"}
+
+    def __init__(self, root, path):
+        super().__init__(root, bg=PANEL, padx=16, pady=14)
+        self.path = path
+        self.title("Результаты — %s" % os.path.basename(path))
+        self.geometry("1300x620+%d+%d" % (root.winfo_rootx() + 40, root.winfo_rooty() + 60))
+        self.sort_by, self.desc = "net_pct", True
+
+        head = h2(self, "Результаты · %s" % os.path.basename(path))
+        ghost(head, "Обновить", self.reload).box.pack(side="right")
+        ghost(head, "Открыть CSV", lambda: App._open(path)).box.pack(side="right", padx=6)
+        self.summary = hint(self, wrap=1200, fg=TEXT)
+        self.summary.pack(fill="x")
+        self.with_liq = tk.BooleanVar(value=False)
+        ttk.Checkbutton(self, text="Показывать ликвидированные", variable=self.with_liq,
+                        command=self._fill).pack(anchor="w", pady=(6, 6))
+
+        box = tk.Frame(self, bg=FIELD)
+        box.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(box, columns=[c for c, _, _ in self.COLS], show="headings")
+        for key, title, width in self.COLS:
+            self.tree.heading(key, text=title, command=lambda k=key: self._sort(k))
+            self.tree.column(key, width=width, anchor="w" if key in self.TEXT_COLS else "center",
+                             stretch=key == "entry")
+        self.tree.tag_configure("plus", foreground=PLUS)
+        self.tree.tag_configure("minus", foreground=MINUS)
+        self.tree.tag_configure("liq", foreground=MINUS, background="#fdf0ee")
+        sb = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y", padx=(0, 1), pady=1)
+        self.tree.pack(fill="both", expand=True, padx=(1, 0), pady=1)
+        hint(self, "Клик по заголовку — сортировка. Строки с ошибкой сервера в таблицу не попадают.",
+             wrap=1200).pack(fill="x", pady=(6, 0))
+        self.reload()
+
+    def reload(self):
+        self.rows, self.errors = [], 0
+        try:
+            with open(self.path, encoding="utf-8-sig", newline="") as f:
+                for r in csv.DictReader(f):
+                    if r.get("error") or r.get("net_pct") in (None, ""):
+                        self.errors += 1
+                        continue
+                    r["entry"] = gbt.entry_name(r)
+                    r["liq_time"] = gbt.fmt_time(r.get("liq_time")) if r.get("liquidated") == "True" else ""
+                    self.rows.append(r)
+        except (OSError, csv.Error, KeyError) as e:
+            self.summary.config(text="Не прочитал %s: %s" % (self.path, e), fg=MINUS)
+            return
+        alive = [r for r in self.rows if r.get("liquidated") != "True"]
+        if self.rows and not alive:
+            self.with_liq.set(True)       # иначе таблица была бы пустой
+        plus = sum(1 for r in alive if float(r["net_pct"]) > 0)
+        self.summary.config(text="Прогонов: %d · без ликвидации: %d · в плюсе без ликвидации: %d · "
+                                 "с ликвидацией: %d · с ошибкой: %d"
+                                 % (len(self.rows), len(alive), plus, len(self.rows) - len(alive),
+                                    self.errors), fg=TEXT)
+        self._fill()
+
+    def _sort(self, key):
+        self.desc = not self.desc if key == self.sort_by else key not in self.TEXT_COLS and key != "max_drawdown"
+        self.sort_by = key
+        self._fill()
+
+    def _fill(self):
+        key = self.sort_by
+
+        def k(r):
+            if key in self.TEXT_COLS:
+                return (0, str(r.get(key) or ""))
+            try:
+                return (0, float(r.get(key)))
+            except (TypeError, ValueError):
+                return (1, 0)
+        rows = [r for r in self.rows if self.with_liq.get() or r.get("liquidated") != "True"]
+        rows.sort(key=k, reverse=self.desc)
+        self.tree.delete(*self.tree.get_children())
+        for r in rows:
+            net = float(r["net_pct"])
+            tag = "liq" if r.get("liquidated") == "True" else ("plus" if net > 0 else "minus")
+            vals = []
+            for c, _, _ in self.COLS:
+                v = r.get(c, "")
+                vals.append("%+.2f" % net if c == "net_pct" else v)
+            self.tree.insert("", "end", values=vals, tags=(tag,))
+        for c, title, _ in self.COLS:
+            arrow = (" ▼" if self.desc else " ▲") if c == key else ""
+            self.tree.heading(c, text=title + arrow)
+
+
 # ---------- окно ----------
 
 class App:
@@ -451,8 +552,15 @@ class App:
         st.configure("TCheckbutton", background=PANEL, foreground=TEXT, font=(FONT, 9),
                      indicatorbackground=PANEL, indicatorforeground=ACCENT)
         st.map("TCheckbutton", background=[("active", PANEL)])
-        st.configure("Vertical.TScrollbar", background=CHIP, troughcolor=PANEL, bordercolor=PANEL,
-                     arrowcolor=DIM, lightcolor=CHIP, darkcolor=CHIP)
+        for sb in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
+            st.configure(sb, background=CHIP, troughcolor=PANEL, bordercolor=PANEL,
+                         arrowcolor=DIM, lightcolor=CHIP, darkcolor=CHIP)
+        st.configure("Treeview", background=PANEL, fieldbackground=PANEL, foreground=TEXT,
+                     font=(FONT, 9), rowheight=24, bordercolor=PANEL, lightcolor=PANEL, darkcolor=PANEL)
+        st.map("Treeview", background=[("selected", TINT)], foreground=[("selected", ACCENT)])
+        st.configure("Treeview.Heading", background=CHIP, foreground=DIM, font=(FONT, 9, "bold"),
+                     bordercolor=LINE, lightcolor=CHIP, darkcolor=CHIP, relief="flat")
+        st.map("Treeview.Heading", background=[("active", CHIP_HOVER)])
 
     def _entry(self, parent, var, width=10, center=True):
         e = ttk.Entry(parent, textvariable=var, width=width, justify="center" if center else "left",
@@ -605,12 +713,15 @@ class App:
         sym = next((s for s in syms if self.data and s in self.data["pairs"]), None)
         text = "Последние %d %s каждой пары" % (y[0], plural(y[0], "год", "года", "лет"))
         if sym:
-            lo, hi, _ = gbt.period_for(self.data["pairs"][sym], {"years": y[0]})
+            lo, hi, months = gbt.period_for(self.data["pairs"][sym], {"years": y[0]})
             self._filling = True
             self.date_from.set(lo)
             self.date_to.set(hi)
             self._filling = False
-            text += " (у %s: %s — %s)" % (base(sym), lo, hi)
+            if len(months) < y[0] * 12:
+                text += " (у %s история на сайте короче — берётся вся: %s — %s)" % (base(sym), lo, hi)
+            else:
+                text += " (у %s: %s — %s)" % (base(sym), lo, hi)
         self.period_note.config(text=text + ".")
 
     # ---------- «Настройки сетки» ----------
@@ -733,13 +844,17 @@ class App:
         ghost(head, "Очистить", self._clear_log).box.pack(side="right")
         box = tk.Frame(p, bg=LINE)
         box.pack(fill="both", expand=True)
-        self.log = tk.Text(box, wrap="word", state="disabled", font=("Consolas", 9), bd=0,
+        # без переноса строк: таблица «Лучших результатов» должна стоять колонками
+        self.log = tk.Text(box, wrap="none", state="disabled", font=("Consolas", 9), bd=0,
                            highlightthickness=0, bg=PANEL, fg=TEXT, padx=6, pady=4)
         self.log.tag_config("err", foreground=MINUS)
+        self.log.tag_config("warn", foreground=WARN)
         self.log.tag_config("ok", foreground=PLUS)
         self.log.tag_config("cmd", foreground=ACCENT)
         sb = ttk.Scrollbar(box, orient="vertical", command=self.log.yview)
-        self.log.configure(yscrollcommand=sb.set)
+        hs = ttk.Scrollbar(box, orient="horizontal", command=self.log.xview)
+        self.log.configure(yscrollcommand=sb.set, xscrollcommand=hs.set)
+        hs.pack(side="bottom", fill="x", padx=1, pady=(0, 1))
         sb.pack(side="right", fill="y", padx=(0, 1), pady=1)
         self.log.pack(fill="both", expand=True, padx=(1, 0), pady=1)
 
@@ -970,6 +1085,7 @@ class App:
                     self._show_left(*payload)
                 elif kind == "line":
                     self.say(payload, "err" if ("ОШИБКА" in payload or "Traceback" in payload)
+                             else "warn" if "ЛИКВИДАЦИ" in payload
                              else ("cmd" if payload.startswith("$ ") else None))
                 elif kind == "done":
                     self._on_done(payload)
@@ -1246,10 +1362,8 @@ class App:
     def _show_eta(self, cfg, total, left):
         n = total if left is None else left
         rpm, rph = cfg["rate_per_min"], cfg["rate_per_hour"]
-        mins = max(n / rpm, n / rph * 60)
-        eta = "%d мин" % mins if mins < 120 else ("%.1f ч" % (mins / 60) if mins < 48 * 60
-                                                  else "%.1f сут" % (mins / 60 / 24))
-        text = "≈ %s при %d прогонов в час" % (eta, rph) if n else "считать нечего"
+        eta = gbt.fmt_eta(gbt.eta_minutes(n, rpm, rph))
+        text = "≈ %s (сервер: %d в минуту, %d в час)" % (eta, rpm, rph) if n else "считать нечего"
         if left is not None and left < total:
             text = "В %s уже посчитано %s, осталось %s — %s" % (
                 cfg["output"], spaced(total - left), spaced(left), text)
@@ -1301,11 +1415,11 @@ class App:
         self.run_cmd(["sweep", os.path.basename(CFG_PATH)])
 
     def show_top(self):
-        out = self.output.get().strip() or "results.csv"
-        if not os.path.exists(os.path.join(HERE, out)):
-            self.say("Файла %s ещё нет — сначала запустите прогон." % out)
+        out = os.path.join(HERE, self.output.get().strip() or "results.csv")
+        if not os.path.exists(out):
+            self.say("Файла %s ещё нет — сначала запустите прогон." % os.path.basename(out))
             return
-        self.run_cmd(["top", out, "-n", "30"])
+        Results(self.root, out)
 
     def open_csv(self):
         out = os.path.join(HERE, self.output.get().strip() or "results.csv")
@@ -1505,6 +1619,8 @@ class App:
         else:
             self.say("Завершено успешно.", "ok")
             self.set_status("Готово")
+            if args and args[0] == "sweep":
+                self.show_top()       # как «Результаты» на сайте: итоги сразу после прогона
         if args and args[0] in ("login", "me"):
             self.check_session()
         self._schedule()      # обновить «уже посчитано»

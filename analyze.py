@@ -9,6 +9,7 @@ from collections import defaultdict
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gbt  # noqa: E402
 from gbt import entry_name  # noqa: E402
 
 if len(sys.argv) < 2:
@@ -32,26 +33,36 @@ def line(r):
                                  r["entries"], entry_name(r)))
 
 
-# фронт Парето: нет настройки, у которой и итог больше, и просадка меньше
-front, best = [], -1e18
-for r in sorted(alive, key=lambda r: (r["dd"], -r["np"])):
-    if r["np"] > best:
-        front.append(r)
-        best = r["np"]
-print("\nФронт Парето (каждая следующая — прибыльнее, но с большей просадкой):")
-for r in front:
-    print("  " + line(r))
+if not alive:
+    print("\nВсе прогоны закончились ликвидацией — фронт Парето и лучшие не строятся.\n"
+          "Смотрите на дату ликвидации; попробуйте плечо меньше, перекрытие больше "
+          "или другой период.")
+    for r in sorted(rows, key=lambda r: r.get("liq_time") or "")[:15]:
+        print("  ликвидация %-16s %s" % (gbt.fmt_time(r.get("liq_time")) or "?", line(r)))
+else:
+    # фронт Парето: нет настройки, у которой и итог больше, и просадка меньше
+    front, best = [], -1e18
+    for r in sorted(alive, key=lambda r: (r["dd"], -r["np"])):
+        if r["np"] > best:
+            front.append(r)
+            best = r["np"]
+    print("\nФронт Парето (каждая следующая — прибыльнее, но с большей просадкой):")
+    for r in front:
+        print("  " + line(r))
 
-print("\nЛучшая по итогу при просадке не больше X:")
-for cap in (5, 10, 15, 20, 30, 40, 50):
-    ok = [r for r in alive if r["dd"] <= cap]
-    if ok:
-        print("  ≤%2d%%: %s" % (cap, line(max(ok, key=lambda r: r["np"]))))
+    print("\nЛучшая по итогу при просадке не больше X:")
+    for cap in (5, 10, 15, 20, 30, 40, 50):
+        ok = [r for r in alive if r["dd"] <= cap]
+        if ok:
+            print("  ≤%2d%%: %s" % (cap, line(max(ok, key=lambda r: r["np"]))))
 
-print("\nТоп-15 по отношению итог / просадка (в плюсе, без ликвидации):")
-for r in sorted((r for r in alive if r["np"] > 0),
-                key=lambda r: r["np"] / max(r["dd"], 1), reverse=True)[:15]:
-    print("  %5.2f  %s" % (r["np"] / max(r["dd"], 1), line(r)))
+    print("\nТоп-15 по отношению итог / просадка (в плюсе, без ликвидации):")
+    plus = sorted((r for r in alive if r["np"] > 0),
+                  key=lambda r: r["np"] / max(r["dd"], 1), reverse=True)[:15]
+    for r in plus:
+        print("  %5.2f  %s" % (r["np"] / max(r["dd"], 1), line(r)))
+    if not plus:
+        print("  (настроек в плюсе нет)")
 
 print("\nПо входам: сколько настроек выжило / лучший итог")
 by = defaultdict(list)

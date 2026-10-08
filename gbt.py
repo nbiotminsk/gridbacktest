@@ -585,10 +585,11 @@ def cmd_sweep(args):
     todo = [j for j in jobs if j[0] not in seen]
     LIMITER.per_min = max(1, int(cfg.get("rate_per_min", 18)))
     LIMITER.per_hour = max(1, int(cfg.get("rate_per_hour", 145)))
-    mins = max(len(todo) / LIMITER.per_min, len(todo) / LIMITER.per_hour * 60)
-    print("Комбинаций всего: %d, уже посчитано: %d, осталось: %d (не меньше %s: сервер даёт %d прогонов в час)"
+    print("Комбинаций всего: %d, уже посчитано: %d, осталось: %d (примерно %s: сервер даёт %d прогонов "
+          "в минуту и %d в час)"
           % (len(jobs), len(jobs) - len(todo), len(todo),
-             "%d мин" % mins if mins < 120 else "%.1f ч" % (mins / 60), LIMITER.per_hour))
+             fmt_eta(eta_minutes(len(todo), LIMITER.per_min, LIMITER.per_hour)),
+             LIMITER.per_min, LIMITER.per_hour))
     if args.dry_run:
         names = sorted({row["entry"] for _, _, row in jobs})
         print("Вариантов входа: %d" % len(names))
@@ -650,6 +651,7 @@ def cmd_sweep(args):
                 if out:
                     bt = out.get("by_trades") or {}
                     row.update({col: bt.get(k) for k, col in RESULT_COLS.items()})
+                    row["liq_time"] = fmt_time(row.get("liq_time"))
                     row["seconds"] = out.get("seconds")
                     if out.get("locked"):     # нули гостя — после входа пересчитаются
                         row["error"] = "locked"
@@ -666,13 +668,14 @@ def cmd_sweep(args):
                 n += 1
                 el = time.time() - started
                 eta = el / n * (len(todo) - n)
-                tag = ("ОШИБКА " + err) if err else "net %+.2f%% dd %s%%%s" % (
+                # итог — в начале строки: в узком журнале GUI он виден без прокрутки
+                tag = ("ОШИБКА " + err) if err else "итог %+.2f%% просадка %s%%%s" % (
                     row.get("net_pct") or 0, row.get("max_drawdown"),
-                    " ЛИКВИДАЦИЯ" if row.get("liquidated") else "")
-                print("[%d/%d] %s %s ov%s ord%s pf%s vf%s tp%s | %s -> %s | ETA %dм"
-                      % (n, len(todo), row["symbol"], row["position"], row["price_overlap"],
+                    " ЛИКВИДАЦИЯ %s" % (row.get("liq_time") or "") if row.get("liquidated") else "")
+                print("[%d/%d] %s | %s %s ov%s ord%s pf%s vf%s tp%s | %s | ETA %dм"
+                      % (n, len(todo), tag, row["symbol"], row["position"], row["price_overlap"],
                          row["orders"], row["price_factor"], row["volume_factor"], row["profit"],
-                         entry_name(row), tag, eta // 60))
+                         entry_name(row), eta // 60))
                 submit(pool)
             if STOP.is_set():
                 raise Stop("остановлено по запросу")
@@ -703,25 +706,70 @@ def entry_name(row):
     return row["entry"]                            # своё правило: tf уже в подписи
 
 
+def eta_minutes(n, per_min, per_hour):
+    """Сколько минут займут n прогонов при лимитах сервера (если за последний час прогонов не было).
+
+    Лимиты скользящие: до per_hour прогонов идут подряд, по per_min в минуту; дальше каждая
+    следующая порция ждёт, пока первые прогоны часа «выйдут» из окна.
+    """
+    if n <= 0:
+        return 0
+    hours = (n - 1) // per_hour
+    rest = n - hours * per_hour
+    return hours * 60 + (rest - 1) // per_min
+
+
+def fmt_eta(mins):
+    if mins < 1:
+        return "меньше минуты"
+    if mins < 120:
+        return "%d мин" % mins
+    if mins < 48 * 60:
+        return "%.1f ч" % (mins / 60)
+    return "%.1f сут" % (mins / 60 / 24)
+
+
+def fmt_time(v):
+    """Время сервера (мс или с от 1970) -> «2023-10-12 04:46» UTC; остальное — как есть."""
+    try:
+        t = float(v)
+    except (TypeError, ValueError):
+        return v
+    if t < 1e9:
+        return v
+    return time.strftime("%Y-%m-%d %H:%M", time.gmtime(t / 1000 if t > 1e11 else t))
+
+
 def show_top(path, limit, allow_liq=False, by="net_pct"):
-    rows = []
+    rows, liq = [], 0
     with open(path, encoding="utf-8-sig", newline="") as f:
         for r in csv.DictReader(f):
             if r.get("error") or r.get(by) in (None, ""):
                 continue
-            if not allow_liq and r.get("liquidated") == "True":
-                continue
+            if r.get("liquidated") == "True":
+                liq += 1
+                if not allow_liq:
+                    continue
             rows.append(r)
+    if not rows and liq:
+        print("\nВсе %d прогонов закончились ликвидацией — показываю их:" % liq)
+        return show_top(path, limit, True, by)
     rows.sort(key=lambda r: float(r[by]), reverse=by != "max_drawdown")
     print("\nТоп-%d по %s%s:" % (limit, by, "" if allow_liq else " (без ликвидаций)"))
     print("%-12s %-7s %6s %5s %5s %5s %5s %4s %9s %8s %6s  %s"
           % ("пара", "сторона", "перекр", "ордер", "pf", "vf", "тейк", "лев",
              "итог %", "просадка", "сделок", "вход"))
     for r in rows[:limit]:
-        print("%-12s %-7s %6s %5s %5s %5s %5s %4s %9.2f %8s %6s  %s"
+        print("%-12s %-7s %6s %5s %5s %5s %5s %4s %9.2f %8s %6s  %s%s"
               % (r["symbol"], r["position"], r["price_overlap"], r["orders"], r["price_factor"],
                  r["volume_factor"], r["profit"], r["leverage"], float(r["net_pct"]),
-                 r["max_drawdown"], r["entries"], entry_name(r)))
+                 r["max_drawdown"], r["entries"], entry_name(r),
+                 "  ЛИКВИДАЦИЯ %s" % fmt_time(r.get("liq_time")) if r.get("liquidated") == "True" else ""))
+    if not rows:
+        print("  (нет посчитанных строк)")
+    elif liq and not allow_liq:
+        print("Скрыто с ликвидацией: %d (показать: python gbt.py top %s --with-liq)"
+              % (liq, os.path.basename(path)))
 
 
 def cmd_top(args):
