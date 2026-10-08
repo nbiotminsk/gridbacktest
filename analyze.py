@@ -20,16 +20,25 @@ for path in sys.argv[1:]:
     with open(path, encoding="utf-8-sig", newline="") as f:
         rows += [r for r in csv.DictReader(f) if not r.get("error")]
 for r in rows:
-    r["np"], r["dd"] = float(r["net_pct"]), float(r["max_drawdown"])
-alive = [r for r in rows if r["liquidated"] != "True"]
+    (r["np"], r["liq"]), r["dd"] = gbt.effective(r), float(r["max_drawdown"])   # со стопом — оценка
+alive = [r for r in rows if not r["liq"]]
 print("Прогонов: %d, без ликвидации: %d, в плюсе без ликвидации: %d"
       % (len(rows), len(alive), sum(r["np"] > 0 for r in alive)))
 
 
+has_stop = any(r.get("stop_loss") for r in rows)
+if has_stop:
+    print("Стоп-лосс: итог со стопом — оценка по сделкам прогона; просадка — сервера, без стопа.")
+
+
 def line(r):
-    return ("%-5s ov%-4s ord%-3s pf%-4s vf%-4s tp%-4s lev%-3s | итог %+8.2f%%  просадка %5.1f%%  "
+    stop = ""
+    if has_stop:
+        stop = ("стоп %-4s (%s) " % (r["stop_loss"] + "%", r.get("stop_hits") or 0)
+                if r.get("stop_loss") else "без стопа      ")
+    return ("%-5s ov%-4s ord%-3s pf%-4s vf%-4s tp%-4s lev%-3s %s| итог %+8.2f%%  просадка %5.1f%%  "
             "сделок %-4s | %s" % (r["position"], r["price_overlap"], r["orders"], r["price_factor"],
-                                 r["volume_factor"], r["profit"], r["leverage"], r["np"], r["dd"],
+                                 r["volume_factor"], r["profit"], r["leverage"], stop, r["np"], r["dd"],
                                  r["entries"], entry_name(r)))
 
 
@@ -69,8 +78,20 @@ by = defaultdict(list)
 for r in rows:
     by[(r["position"], entry_name(r))].append(r)
 for (pos, name), rs in sorted(by.items(), key=lambda kv: -max(
-        (r["np"] for r in kv[1] if r["liquidated"] != "True"), default=-1e9)):
-    ok = [r for r in rs if r["liquidated"] != "True"]
+        (r["np"] for r in kv[1] if not r["liq"]), default=-1e9)):
+    ok = [r for r in rs if not r["liq"]]
     b = max(ok, key=lambda r: r["np"]) if ok else None
     print("  %-5s %-28s выжило %2d/%-2d  %s" % (pos, name, len(ok), len(rs),
           "лучший %+.1f%% (dd %.1f%%)" % (b["np"], b["dd"]) if b else "—"))
+
+if has_stop:
+    print("\nПо стопу: сколько настроек выжило, сколько в среднем стопов, лучший и средний итог")
+    by = defaultdict(list)
+    for r in rows:
+        by[float(r["stop_loss"]) if r.get("stop_loss") else 0.0].append(r)
+    for st, rs in sorted(by.items()):
+        ok = [r for r in rs if not r["liq"]]
+        hits = [int(r.get("stop_hits") or 0) for r in rs]
+        print("  %-10s выжило %3d/%-3d  стопов в среднем %5.1f  лучший %+9.1f%%  средний %+9.1f%%"
+              % ("%g%%" % st if st else "без стопа", len(ok), len(rs), sum(hits) / len(rs),
+                 max(r["np"] for r in rs), sum(r["np"] for r in rs) / len(rs)))

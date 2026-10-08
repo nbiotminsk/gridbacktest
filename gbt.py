@@ -42,9 +42,12 @@ RESULT_COLS = {"net": "net", "net_pct": "net_pct", "max_drawdown": "max_drawdown
                "cycles": "cycles", "profit": "gross_profit", "loss": "gross_loss", "fees": "fees",
                "funding": "funding", "stops": "stops", "orders_filled": "orders_filled",
                "deepest_level": "deepest_level", "open_at_end": "open_at_end"}
+# стоп-лосс сервер не считает — оценка по сделкам из ответа (stop_eval); пусто — без стопа
+STOP_COLS = ["stop_loss", "stop_hits", "stop_maybe", "stop_cost", "net_stop", "net_stop_pct",
+             "net_stop_worst_pct", "liq_avoided", "stop_wiped"]
 CSV_COLS = (["key", "symbol", "position", "from", "to", "months", "entry", "entry_tf",
              "swing_level", "chart_tf"] + PARAM_KEYS + ["fee_maker", "fee_taker"]
-            + list(RESULT_COLS.values()) + ["seconds", "error"])
+            + list(RESULT_COLS.values()) + STOP_COLS + ["seconds", "error"])
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)  # лог в файл — построчно
@@ -441,6 +444,210 @@ def count_jobs(cfg, data):
     return total
 
 
+# ---------- стоп-лосс (оценка по сделкам из ответа сервера) ----------
+#
+# Сервер стоп не принимает (09.10.2026: в /api/run нет такого параметра), но в ответе есть все
+# сделки: цена входа, цены доборов, закрытие. Стоп бота считается от средней цены позиции и
+# переносится при каждом доборе, поэтому:
+#   * добор k ниже стопа после добора k−1 (в лонге) — цена прошла через стоп раньше: стоп точно;
+#   * после последнего добора точной ленты нет — смотрим свечи графика; если до стопа дошло
+#     только в свече закрытия (или открытия без доборов), порядок внутри свечи неизвестен —
+#     это «возможный» стоп, отдельным счётчиком.
+# Сделок, которые бот открыл бы после стопа, сервер не считал — итог со стопом это оценка.
+
+def stop_list(cfg):
+    """Значения стопа из конфига, % от средней цены; 0 — без стопа."""
+    return [norm_num(v) for v in as_list(cfg.get("stop_loss", [0]))] or [0]
+
+
+def norm_num(v):
+    v = float(v)
+    return int(v) if v.is_integer() else v
+
+
+def stop_str(v):
+    """Значение стопа в колонке stop_loss: '' — без стопа."""
+    return "" if v in (None, "", 0, "0") or float(v) == 0 else "%g" % float(v)
+
+
+def grid_sizes(p):
+    """Объёмы ордеров сетки в USDT: растут в volume_factor раз (совпадает со средней сервера)."""
+    w = [p["volume_factor"] ** i for i in range(int(p["orders"]))]
+    total = p["deposit"] * p["leverage"]
+    return [total * x / sum(w) for x in w]
+
+
+def stop_data(out):
+    """Сделки ответа в сжатом виде для stop_eval:
+    [вход, доборов, закрытие (только у ликвидации), вид|None, итог $|None, экстремум точно,
+     экстремум с сомнением, время закрытия|None]. Доборы — числом: их цены — уровни сетки
+    (grid_offsets), так .jsonl в разы меньше; старый формат со списком цен тоже читается.
+    Экстремум — минимум (лонг) или максимум (шорт) цены после последнего добора до закрытия."""
+    long = out.get("params", {}).get("position", "long") == "long"
+    candles = out.get("candles") or []
+    step = candles[1][0] - candles[0][0] if len(candles) > 1 else 0
+    end = (out.get("span") or [0, 0])[1] / 1000
+    pick = min if long else max
+    res = []
+    for d in out.get("deals") or []:
+        t_open, p_open, t_close, p_close, kind, pnl, adds = d[:7]
+        t_last = adds[-1][0] if adds else t_open
+        t_end = t_close or end
+        sure, maybe = [], []
+        for c in candles:
+            if c[0] + step <= t_last or c[0] >= t_end:
+                continue
+            v = c[3] if long else c[2]
+            in_close = t_close is not None and c[0] <= t_close < c[0] + step
+            in_open = not adds and c[0] <= t_open < c[0] + step
+            (maybe if in_close or in_open else sure).append(v)
+        res.append([p_open, len(adds), p_close if kind == "liq" else None, kind, pnl,
+                    sig(pick(sure)) if sure else None,
+                    sig(pick(sure + maybe)) if sure or maybe else None, t_close])
+    return res
+
+
+def grid_offsets(p):
+    """Уровни сетки, % от цены входа (как gridShape на сайте; совпадает с grid.levels сервера)."""
+    n, ov, f = max(1, round(p["orders"])), p["price_overlap"], p["price_factor"]
+    if n < 2:
+        return [0]
+    if abs(f - 1) < 1e-12:
+        gaps = [ov / (n - 1)] * (n - 1)
+    else:
+        first = ov * (f - 1) / (f ** (n - 1) - 1)
+        gaps = [first * f ** i for i in range(n - 1)]
+    offs = [0]
+    for g in gaps:
+        offs.append(offs[-1] + g)
+    return offs
+
+
+def sig(v):
+    return float("%.7g" % v)
+
+
+def stop_eval(sd, p, stop_pct):
+    """Что было бы со стопом stop_pct % от средней. Два счёта: «точно» — только стопы, в которых
+    сомнений нет; «хуже» — ещё и возможные (до стопа дошло только внутри свечи закрытия).
+
+    -> dict(hits, maybe, cost, delta, delta_worst, wiped, wiped_worst, liq_avoided).
+    delta — на сколько $ изменился бы итог: минус прибыль остановленных кругов, минус потери по
+    стопу. Счёт ведётся по сделкам по порядку: если он дошёл до нуля — депозит закончился (wiped)."""
+    long = p.get("position", "long") == "long"
+    s = float(stop_pct) / 100
+    sizes = grid_sizes(p)
+    offs = grid_offsets(p)
+    fm, ft = p.get("fee_maker", 0.0002), p.get("fee_taker", 0.0005)
+    dep = p["deposit"]
+    hits = maybe = 0
+    cost = 0.0
+    liq_avoided = False
+    acc = {"sure": [0.0, dep, None], "worst": [0.0, dep, None]}   # [delta, счёт, когда кончился]
+
+    def crossed(price, stop):
+        return price <= stop if long else price >= stop
+
+    def book(name, result, pnl, t):
+        a = acc[name]
+        if a[2]:
+            return
+        a[0] += result - (pnl or 0)
+        a[1] += result
+        if a[1] <= 0:
+            a[2] = fmt_time(t) if t else "да"
+
+    for d in sd:
+        if acc["sure"][2]:
+            break                       # депозит кончился — дальше бот не торговал бы
+        p_open, adds, p_close, kind, pnl, ext_sure, ext_any = d[:7]
+        t = d[7] if len(d) > 7 else None
+        if isinstance(adds, int):       # число доборов -> их цены по уровням сетки
+            adds = [p_open * (1 - offs[i] / 100) if long else p_open * (1 + offs[i] / 100)
+                    for i in range(1, min(adds, len(offs) - 1) + 1)]
+        q = c = 0.0
+        stop = None
+        hit = False
+        for i, pr in enumerate([p_open] + adds):
+            if i and crossed(pr, stop):
+                hit = True              # до этого добора цена прошла через стоп
+                break
+            q += sizes[min(i, len(sizes) - 1)]
+            c += sizes[min(i, len(sizes) - 1)] / pr
+            avg = q / c
+            stop = avg * (1 - s) if long else avg * (1 + s)
+        possible = False
+        if not hit:
+            k = len(adds) + 1           # следующий, не исполненный уровень сетки
+            nxt = None
+            if k < len(offs):
+                nxt = p_open * (1 - offs[k] / 100) if long else p_open * (1 + offs[k] / 100)
+            ext = p_close if kind == "liq" else ext_sure
+            if ext is not None and crossed(ext, stop):
+                hit = True
+            elif nxt is not None and kind != "liq" and crossed(stop, nxt):
+                pass                    # до следующего уровня цена не дошла, а стоп за ним — точно нет
+            elif ext_any is not None and crossed(ext_any, stop):
+                possible = True
+        if hit or possible:
+            loss = (q - c * stop) if long else (c * stop - q)
+            result = -(loss + sizes[0] * ft + (q - sizes[0]) * fm + c * stop * ft)
+        if hit:
+            hits += 1
+            cost -= result
+            book("sure", result, pnl, t)
+            book("worst", result, pnl, t)
+            liq_avoided = liq_avoided or kind == "liq"
+        else:
+            book("sure", pnl or 0, pnl, t)
+            if possible:
+                maybe += 1
+                book("worst", result, pnl, t)
+            else:
+                book("worst", pnl or 0, pnl, t)
+    return {"hits": hits, "maybe": maybe, "cost": cost, "liq_avoided": liq_avoided,
+            "delta": acc["sure"][0], "wiped": acc["sure"][2],
+            "delta_worst": acc["worst"][0], "wiped_worst": acc["worst"][2]}
+
+
+def result_rows(row, out, stops):
+    """Строки CSV для одного ответа сервера: по одной на каждое значение стопа."""
+    row = dict(row)
+    bt = out.get("by_trades") or {}
+    row.update({col: bt.get(k) for k, col in RESULT_COLS.items()})
+    row["liq_time"] = fmt_time(row.get("liq_time"))
+    row["seconds"] = out.get("seconds")
+    if out.get("locked"):     # нули гостя — после входа пересчитаются
+        row["error"] = "locked"
+    rows = []
+    sd = out.get("stopdata")
+    if sd is None and out.get("deals") is not None:
+        sd = stop_data(out)
+    for st in stops:
+        r = dict(row, stop_loss=stop_str(st))
+        if r["stop_loss"] and sd is not None and not r.get("error"):
+            e = stop_eval(sd, dict(out.get("params") or {}, position=row["position"]), st)
+            dep = row["deposit"]
+            net = -dep if e["wiped"] else (bt.get("net") or 0) + e["delta"]
+            worst = -dep if e["wiped_worst"] else (bt.get("net") or 0) + e["delta_worst"]
+            r.update(stop_hits=e["hits"], stop_maybe=e["maybe"], stop_cost=round(e["cost"], 2),
+                     net_stop=round(net, 2), net_stop_pct=round(net / dep * 100, 2),
+                     net_stop_worst_pct=round(worst / dep * 100, 2),
+                     liq_avoided=e["liq_avoided"], stop_wiped=e["wiped"] or "")
+        rows.append(r)
+    return rows
+
+
+def effective(r):
+    """(итог %, ликвидация?) строки CSV с учётом оценки стопа (по точным стопам).
+    Со стопом «ликвидация» — это и депозит, кончившийся на стопах (stop_wiped)."""
+    if r.get("stop_loss") and r.get("net_stop_pct") not in (None, ""):
+        return float(r["net_stop_pct"]), ((r.get("liquidated") == "True"
+                                           and r.get("liq_avoided") != "True")
+                                          or r.get("stop_wiped") not in (None, "", "False"))
+    return float(r["net_pct"]), r.get("liquidated") == "True"
+
+
 # ---------- прогон ----------
 
 class Stop(Exception):
@@ -560,16 +767,76 @@ def run_one(base_session, req, retries=5):
     return None, err
 
 
-def done_keys(path):
-    keys = set()
+def done_pairs(path):
+    """{(key, стоп)} посчитанных строк CSV; стоп — как в колонке stop_loss ('' — без стопа)."""
+    pairs = set()
     if os.path.exists(path):
         with open(path, encoding="utf-8-sig", newline="") as f:
             for row in csv.DictReader(f):
                 # пустая ошибка или 4xx (неверные параметры) — посчитано окончательно;
                 # сеть, 5xx и locked — пересчитать при следующем запуске
                 if not row.get("error") or row["error"].startswith("HTTP 4"):
-                    keys.add(row["key"])
-    return keys
+                    pairs.add((row["key"], stop_str(row.get("stop_loss"))))
+    return pairs
+
+
+def done_keys(path):
+    return {k for k, _ in done_pairs(path)}
+
+
+def plan(cfg, jobs, out_csv, pairs=None):
+    """Что считать: (на сервере [(job, стопы)], без сервера [(job, стопы)]).
+
+    Без сервера — если прогон уже есть в CSV, не хватает только строк с другими стопами, а в
+    .jsonl сохранены его сделки: стоп пересчитывается по ним, лимит сервера не тратится."""
+    stops = stop_list(cfg)
+    pairs = done_pairs(out_csv) if pairs is None else pairs
+    keys = {k for k, _ in pairs}
+    server, local = [], []
+    for job in jobs:
+        need = [st for st in stops if (job[0], stop_str(st)) not in pairs]
+        if need:
+            (local if job[0] in keys else server).append((job, need))
+    if local:
+        have = stored_results(os.path.splitext(out_csv)[0] + ".jsonl", {j[0] for j, _ in local})
+        server += [(j, need) for j, need in local if j[0] not in have]
+        local = [(j, need, have[j[0]]) for j, need in local if j[0] in have]
+    return server, local
+
+
+def stored_results(path, keys):
+    """{key: result} из .jsonl для нужных ключей — только ответы со сделками (stopdata)."""
+    found = {}
+    if not keys or not os.path.exists(path):
+        return found
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if '"stopdata"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if d.get("key") in keys and d.get("result", {}).get("stopdata") is not None:
+                found[d["key"]] = d["result"]
+    return found
+
+
+def upgrade_csv(path):
+    """Старый CSV без колонок стопа — переписать с новой шапкой, иначе дописанные строки съедут."""
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        rd = csv.DictReader(f)
+        if rd.fieldnames == CSV_COLS:
+            return
+        rows = list(rd)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_COLS, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+    os.replace(tmp, path)
 
 
 def cmd_sweep(args):
@@ -581,15 +848,23 @@ def cmd_sweep(args):
     out_csv = args.out or os.path.join(os.path.dirname(os.path.abspath(args.config)),
                                        cfg.get("output", "results.csv"))
     out_jsonl = os.path.splitext(out_csv)[0] + ".jsonl"
-    seen = done_keys(out_csv)
-    todo = [j for j in jobs if j[0] not in seen]
+    stops = stop_list(cfg)
+    todo, local = plan(cfg, jobs, out_csv)
     LIMITER.per_min = max(1, int(cfg.get("rate_per_min", 18)))
     LIMITER.per_hour = max(1, int(cfg.get("rate_per_hour", 145)))
+    n_done = len(jobs) - len(todo)       # на сервере; local — только новые значения стопа
     print("Комбинаций всего: %d, уже посчитано: %d, осталось: %d (примерно %s: сервер даёт %d прогонов "
           "в минуту и %d в час)"
-          % (len(jobs), len(jobs) - len(todo), len(todo),
+          % (len(jobs), n_done, len(todo),
              fmt_eta(eta_minutes(len(todo), LIMITER.per_min, LIMITER.per_hour)),
              LIMITER.per_min, LIMITER.per_hour))
+    if any(stops):
+        print("Стоп-лосс: %s %% от средней цены — %d %s на каждый прогон, сервер их не считает "
+              "(оценка по сделкам, новых прогонов не нужно)"
+              % (", ".join(stop_str(v) or "без стопа" for v in stops), len(stops),
+                 "вариант" if len(stops) == 1 else "варианта" if len(stops) < 5 else "вариантов"))
+    if local:
+        print("Без сервера (новые значения стопа по сохранённым сделкам): %d прогонов" % len(local))
     if args.dry_run:
         names = sorted({row["entry"] for _, _, row in jobs})
         print("Вариантов входа: %d" % len(names))
@@ -597,34 +872,47 @@ def cmd_sweep(args):
             print("  " + nm)
         if len(names) > 40:
             print("  … ещё %d" % (len(names) - 40))
-    if args.dry_run or not todo:
+    if args.dry_run or not (todo or local):
+        return
+
+    upgrade_csv(out_csv)
+    new_file = not os.path.exists(out_csv)
+    fcsv = open(out_csv, "a", encoding="utf-8-sig" if new_file else "utf-8", newline="")
+    w = csv.DictWriter(fcsv, fieldnames=CSV_COLS, extrasaction="ignore")
+    if new_file:
+        w.writeheader()
+    for (key, req, row), need, out in local:
+        w.writerows(result_rows(row, out, need))
+    fcsv.flush()
+    if not todo:
+        fcsv.close()
+        print("Готово: пересчитан стоп для %d прогонов. Результаты: %s" % (len(local), out_csv))
+        show_top(out_csv, 15)
         return
 
     me = get_me(s, fresh=True)
     if me.get("bots") != "active":
         print_me(me)
+        fcsv.close()
         if not args.force:
             sys.exit("Остановлено. (--force — считать всё равно, итоги будут нулями)")
         global ALLOW_LOCKED
         ALLOW_LOCKED = True
+        fcsv = open(out_csv, "a", encoding="utf-8", newline="")
+        w = csv.DictWriter(fcsv, fieldnames=CSV_COLS, extrasaction="ignore")
 
     workers = max(1, int(args.workers or cfg.get("workers", 2)))
-    new_file = not os.path.exists(out_csv)
-    fcsv = open(out_csv, "a", encoding="utf-8-sig" if new_file else "utf-8", newline="")
     fjs = open(out_jsonl, "a", encoding="utf-8")
-    w = csv.DictWriter(fcsv, fieldnames=CSV_COLS, extrasaction="ignore")
-    if new_file:
-        w.writeheader()
 
     started, n, errors = time.time(), 0, 0
     pending = {}
     it = iter(todo)
 
     def submit(pool):
-        job = None if STOP.is_set() else next(it, None)
-        if job is None:
+        item = None if STOP.is_set() else next(it, None)
+        if item is None:
             return False
-        pending[pool.submit(run_one, s, job[1])] = job
+        pending[pool.submit(run_one, s, item[0][1])] = item
         return True
 
     stop_file = os.environ.get("GBT_STOP_FILE")   # GUI создаёт этот файл по кнопке «Стоп»
@@ -645,33 +933,36 @@ def cmd_sweep(args):
             finished, _ = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
             # сначала записать готовые итоги, потом — исключения (Stop), чтобы не терять посчитанное
             for fut in sorted(finished, key=lambda f: f.exception() is not None):
-                key, req, row = pending.pop(fut)
+                (key, req, row), need = pending.pop(fut)
                 out, err = fut.result()        # Stop пробрасывается наружу
-                row = dict(row)
                 if out:
-                    bt = out.get("by_trades") or {}
-                    row.update({col: bt.get(k) for k, col in RESULT_COLS.items()})
-                    row["liq_time"] = fmt_time(row.get("liq_time"))
-                    row["seconds"] = out.get("seconds")
-                    if out.get("locked"):     # нули гостя — после входа пересчитаются
-                        row["error"] = "locked"
+                    out = dict(out)
+                    out["stopdata"] = stop_data(out)   # сделки — чтобы менять стоп без сервера
+                    rows = result_rows(row, out, need)
                     slim = {k: v for k, v in out.items()
                             if k not in ("candles", "marks", "deals", "bot")}
                     fjs.write(json.dumps({"key": key, "request": req, "result": slim},
                                          ensure_ascii=False) + "\n")
                 else:
-                    row["error"] = err
+                    rows = [dict(row, stop_loss=stop_str(st), error=err) for st in need]
                     errors += 1
-                w.writerow(row)
+                w.writerows(rows)
                 fcsv.flush()
                 fjs.flush()
                 n += 1
                 el = time.time() - started
                 eta = el / n * (len(todo) - n)
+                row = rows[0]
                 # итог — в начале строки: в узком журнале GUI он виден без прокрутки
                 tag = ("ОШИБКА " + err) if err else "итог %+.2f%% просадка %s%%%s" % (
                     row.get("net_pct") or 0, row.get("max_drawdown"),
                     " ЛИКВИДАЦИЯ %s" % (row.get("liq_time") or "") if row.get("liquidated") else "")
+                for r in rows:
+                    if r.get("stop_hits") not in (None, ""):
+                        tag += " | стоп %s%%: %s%s, итог %+.2f%%%s" % (
+                            r["stop_loss"], r["stop_hits"],
+                            " (+%s?)" % r["stop_maybe"] if r["stop_maybe"] else "",
+                            r["net_stop_pct"], ", без ликвидации" if r["liq_avoided"] else "")
                 print("[%d/%d] %s | %s %s ov%s ord%s pf%s vf%s tp%s | %s | ETA %dм"
                       % (n, len(todo), tag, row["symbol"], row["position"], row["price_overlap"],
                          row["orders"], row["price_factor"], row["volume_factor"], row["profit"],
@@ -689,7 +980,7 @@ def cmd_sweep(args):
         fcsv.close()
         fjs.close()
     print("Готово: %d прогонов, ошибок %d. Результаты: %s" % (n, errors, out_csv))
-    if n:
+    if n or local:
         show_top(out_csv, 15)
 
 
@@ -741,12 +1032,14 @@ def fmt_time(v):
 
 
 def show_top(path, limit, allow_liq=False, by="net_pct"):
+    """Лучшие строки CSV. Итог и ликвидация — с учётом оценки стопа (effective)."""
     rows, liq = [], 0
     with open(path, encoding="utf-8-sig", newline="") as f:
         for r in csv.DictReader(f):
             if r.get("error") or r.get(by) in (None, ""):
                 continue
-            if r.get("liquidated") == "True":
+            r["_net"], r["_liq"] = effective(r)
+            if r["_liq"]:
                 liq += 1
                 if not allow_liq:
                     continue
@@ -754,17 +1047,32 @@ def show_top(path, limit, allow_liq=False, by="net_pct"):
     if not rows and liq:
         print("\nВсе %d прогонов закончились ликвидацией — показываю их:" % liq)
         return show_top(path, limit, True, by)
-    rows.sort(key=lambda r: float(r[by]), reverse=by != "max_drawdown")
-    print("\nТоп-%d по %s%s:" % (limit, by, "" if allow_liq else " (без ликвидаций)"))
-    print("%-12s %-7s %6s %5s %5s %5s %5s %4s %9s %8s %6s  %s"
-          % ("пара", "сторона", "перекр", "ордер", "pf", "vf", "тейк", "лев",
+    has_stop = any(r.get("stop_loss") for r in rows)
+    sort_key = {"net_pct": lambda r: r["_net"]}.get(by, lambda r: float(r[by]))
+    rows.sort(key=sort_key, reverse=by != "max_drawdown")
+    print("\nТоп-%d по %s%s%s:" % (limit, by, "" if allow_liq else " (без ликвидаций)",
+                                  " — итог со стопом: оценка по сделкам" if has_stop else ""))
+    stop_head = " %5s %7s" % ("стоп%", "стопов") if has_stop else ""
+    print("%-12s %-7s %6s %5s %5s %5s %5s %4s%s %9s %8s %6s  %s"
+          % ("пара", "сторона", "перекр", "ордер", "pf", "vf", "тейк", "лев", stop_head,
              "итог %", "просадка", "сделок", "вход"))
     for r in rows[:limit]:
-        print("%-12s %-7s %6s %5s %5s %5s %5s %4s %9.2f %8s %6s  %s%s"
+        stop = ""
+        if has_stop:
+            hits = r.get("stop_hits") or ""
+            if hits and r.get("stop_maybe") not in (None, "", "0"):
+                hits += "+%s?" % r["stop_maybe"]
+            stop = " %5s %7s" % (r.get("stop_loss") or "—", hits or "—")
+        liq_note = ""
+        if r.get("stop_wiped") not in (None, "", "False"):
+            liq_note = "  ДЕПОЗИТ КОНЧИЛСЯ НА СТОПАХ %s" % r["stop_wiped"]
+        elif r.get("liquidated") == "True":
+            liq_note = ("  без ликвидации: стоп раньше %s" if r.get("liq_avoided") == "True"
+                        else "  ЛИКВИДАЦИЯ %s") % fmt_time(r.get("liq_time"))
+        print("%-12s %-7s %6s %5s %5s %5s %5s %4s%s %9.2f %8s %6s  %s%s"
               % (r["symbol"], r["position"], r["price_overlap"], r["orders"], r["price_factor"],
-                 r["volume_factor"], r["profit"], r["leverage"], float(r["net_pct"]),
-                 r["max_drawdown"], r["entries"], entry_name(r),
-                 "  ЛИКВИДАЦИЯ %s" % fmt_time(r.get("liq_time")) if r.get("liquidated") == "True" else ""))
+                 r["volume_factor"], r["profit"], r["leverage"], stop, r["_net"],
+                 r["max_drawdown"], r["entries"], entry_name(r), liq_note))
     if not rows:
         print("  (нет посчитанных строк)")
     elif liq and not allow_liq:

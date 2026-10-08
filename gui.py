@@ -53,6 +53,8 @@ PARAMS = [
 ]
 REINVEST = [(0, "Выкл"), (25, "25"), (50, "50"), (100, "100")]
 PARAM_NAMES = [p[0] for p in PARAMS] + ["reinvest"]
+# стоп-лосс — не параметр сервера: оценивается по сделкам ответа (gbt.stop_eval), 0 — без стопа
+STOP_ROW = ("stop_loss", "Стоп-лосс, %", 0, (0, 90), False, (2, 10, 2))
 # кнопки «Настроек сетки» сайта (app.js, PRESETS)
 PRESETS = {
     "calm": {"price_overlap": 40, "orders": 20, "price_factor": 1.4, "volume_factor": 1.05, "profit": 0.5},
@@ -387,20 +389,22 @@ class Picker(tk.Toplevel):
 class Results(tk.Toplevel):
     """Таблица результатов из CSV: сортировка по клику на заголовок, ликвидации по флажку."""
 
-    COLS = [("symbol", "Пара", 90), ("position", "Сторона", 62), ("price_overlap", "Перекр., %", 78),
-            ("orders", "Ордеров", 66), ("price_factor", "Коэф. цены", 88),
-            ("volume_factor", "Коэф. объёма", 100), ("profit", "Тейк, %", 60), ("leverage", "Плечо", 52),
-            ("reinvest", "Реинв., %", 66), ("net_pct", "Итог, %", 80),
-            ("max_drawdown", "Просадка, %", 86), ("entries", "Сделок", 60),
-            ("entry", "Вход", 210), ("liq_time", "Ликвидация", 120)]
-    TEXT_COLS = {"symbol", "position", "entry", "liq_time"}
+    COLS = [("symbol", "Пара", 84), ("position", "Сторона", 58), ("price_overlap", "Перекр., %", 74),
+            ("orders", "Ордеров", 60), ("price_factor", "Коэф. цены", 78),
+            ("volume_factor", "Коэф. объёма", 90), ("profit", "Тейк, %", 56), ("leverage", "Плечо", 48),
+            ("reinvest", "Реинв., %", 64), ("stop_loss", "Стоп, %", 56), ("stop_hits", "Стопов", 62),
+            ("_net", "Итог, %", 76), ("net_stop_worst_pct", "Хуже, %", 70), ("net_pct", "Без стопа, %", 88),
+            ("max_drawdown", "Просадка, %", 82), ("entries", "Сделок", 56),
+            ("entry", "Вход", 160), ("liq_time", "Ликвидация", 180)]
+    TEXT_COLS = {"symbol", "position", "entry", "liq_time", "stop_hits"}
 
     def __init__(self, root, path):
         super().__init__(root, bg=PANEL, padx=16, pady=14)
         self.path = path
         self.title("Результаты — %s" % os.path.basename(path))
-        self.geometry("1300x620+%d+%d" % (root.winfo_rootx() + 40, root.winfo_rooty() + 60))
-        self.sort_by, self.desc = "net_pct", True
+        self.geometry("%dx620+%d+%d" % (min(1480, root.winfo_screenwidth() - 40), root.winfo_rootx() + 20,
+                                        root.winfo_rooty() + 60))
+        self.sort_by, self.desc = "_net", True
 
         head = h2(self, "Результаты · %s" % os.path.basename(path))
         ghost(head, "Обновить", self.reload).box.pack(side="right")
@@ -422,11 +426,16 @@ class Results(tk.Toplevel):
         self.tree.tag_configure("minus", foreground=MINUS)
         self.tree.tag_configure("liq", foreground=MINUS, background="#fdf0ee")
         sb = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
+        hs = ttk.Scrollbar(box, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=sb.set, xscrollcommand=hs.set)
+        hs.pack(side="bottom", fill="x", padx=1, pady=(0, 1))
         sb.pack(side="right", fill="y", padx=(0, 1), pady=1)
         self.tree.pack(fill="both", expand=True, padx=(1, 0), pady=1)
-        hint(self, "Клик по заголовку — сортировка. Строки с ошибкой сервера в таблицу не попадают.",
-             wrap=1200).pack(fill="x", pady=(6, 0))
+        hint(self, "Клик по заголовку — сортировка. «Итог» со стопом — оценка по сделкам прогона: "
+                   "сервер стоп не считает, а сделок, которые бот открыл бы после стопа, в прогоне нет. "
+                   "«Стопов»: точно + возможно (?) — до стопа дошло только внутри свечи закрытия; "
+                   "«Хуже» — итог, если и возможные стопы сработали. "
+                   "Строки с ошибкой сервера в таблицу не попадают.", wrap=1250).pack(fill="x", pady=(6, 0))
         self.reload()
 
     def reload(self):
@@ -438,16 +447,29 @@ class Results(tk.Toplevel):
                         self.errors += 1
                         continue
                     r["entry"] = gbt.entry_name(r)
-                    r["liq_time"] = gbt.fmt_time(r.get("liq_time")) if r.get("liquidated") == "True" else ""
+                    r["_net"], r["_liq"] = gbt.effective(r)
+                    if r.get("stop_wiped") not in (None, "", "False"):
+                        r["liq_time"] = "депозит кончился на стопах %s" % str(r["stop_wiped"])[:10]
+                    elif r.get("liquidated") != "True":
+                        r["liq_time"] = ""
+                    elif r.get("liq_avoided") == "True":
+                        r["liq_time"] = "нет: стоп до %s" % str(gbt.fmt_time(r.get("liq_time")))[:10]
+                    else:
+                        r["liq_time"] = gbt.fmt_time(r.get("liq_time"))
+                    if r.get("stop_loss"):
+                        r["stop_hits"] = "%s%s" % (r.get("stop_hits") or 0, " +%s?" % r["stop_maybe"]
+                                                   if r.get("stop_maybe") not in (None, "", "0") else "")
+                    else:
+                        r["stop_loss"] = r["stop_hits"] = "—"
                     self.rows.append(r)
         except (OSError, csv.Error, KeyError) as e:
             self.summary.config(text="Не прочитал %s: %s" % (self.path, e), fg=MINUS)
             return
-        alive = [r for r in self.rows if r.get("liquidated") != "True"]
+        alive = [r for r in self.rows if not r["_liq"]]
         if self.rows and not alive:
             self.with_liq.set(True)       # иначе таблица была бы пустой
-        plus = sum(1 for r in alive if float(r["net_pct"]) > 0)
-        self.summary.config(text="Прогонов: %d · без ликвидации: %d · в плюсе без ликвидации: %d · "
+        plus = sum(1 for r in alive if r["_net"] > 0)
+        self.summary.config(text="Вариантов: %d · без ликвидации: %d · в плюсе без ликвидации: %d · "
                                  "с ликвидацией: %d · с ошибкой: %d"
                                  % (len(self.rows), len(alive), plus, len(self.rows) - len(alive),
                                     self.errors), fg=TEXT)
@@ -468,16 +490,22 @@ class Results(tk.Toplevel):
                 return (0, float(r.get(key)))
             except (TypeError, ValueError):
                 return (1, 0)
-        rows = [r for r in self.rows if self.with_liq.get() or r.get("liquidated") != "True"]
+        rows = [r for r in self.rows if self.with_liq.get() or not r["_liq"]]
         rows.sort(key=k, reverse=self.desc)
         self.tree.delete(*self.tree.get_children())
         for r in rows:
-            net = float(r["net_pct"])
-            tag = "liq" if r.get("liquidated") == "True" else ("plus" if net > 0 else "minus")
+            net = r["_net"]
+            tag = "liq" if r["_liq"] else ("plus" if net > 0 else "minus")
             vals = []
             for c, _, _ in self.COLS:
                 v = r.get(c, "")
-                vals.append("%+.2f" % net if c == "net_pct" else v)
+                if c == "_net":
+                    v = "%+.2f" % net
+                elif c in ("net_pct", "net_stop_worst_pct") and v not in (None, ""):
+                    v = "%+.2f" % float(v)
+                elif c == "net_stop_worst_pct":
+                    v = "—"
+                vals.append(v)
             self.tree.insert("", "end", values=vals, tags=(tag,))
         for c, title, _ in self.COLS:
             arrow = (" ▼" if self.desc else " ▲") if c == key else ""
@@ -741,26 +769,8 @@ class App:
         for c, text in enumerate(("", "Значение", "", "от", "до", "шаг", "вариантов")):
             field_label(tbl, text).grid(row=0, column=c, pady=(0, 2))
         self.rows = {}
-        for r, (key, label, default, lim, isint, (lo, hi, step)) in enumerate(PARAMS, 1):
-            tk.Label(tbl, text=label, bg=PANEL, fg=TEXT, font=(FONT, 9)).grid(
-                row=r, column=0, sticky="w", padx=(0, 10), pady=3)
-            row = {"label": label, "limit": lim, "int": isint, "default": default,
-                   "value": self._var("%g" % default), "lo": self._var("%g" % lo),
-                   "hi": self._var("%g" % hi), "step": self._var("%g" % step)}
-            if key in PRESETS["mid"]:      # правка поля снимает подсветку пресета, как на сайте
-                row["value"].trace_add("write", lambda *_a: self._filling or self.presets.set([]))
-            row["e_value"] = self._entry(tbl, row["value"], width=12)
-            row["e_value"].grid(row=r, column=1, sticky="ew")
-            row["range"] = Toggle(tbl, "перебор", padx=8,
-                                  command=lambda t, k=key: self._toggle_range(k))
-            row["range"].grid(row=r, column=2, padx=8)
-            for c, k in ((3, "lo"), (4, "hi"), (5, "step")):
-                row["e_" + k] = self._entry(tbl, row[k], width=7)
-                row["e_" + k].grid(row=r, column=c, padx=(0, 4))
-            row["count"] = tk.Label(tbl, text="1", bg=PANEL, fg=DIM, font=(FONT, 9, "bold"), width=8)
-            row["count"].grid(row=r, column=6)
-            self.rows[key] = row
-            self._row_state(key)
+        for r, spec in enumerate(PARAMS, 1):
+            self._param_row(tbl, r, spec)
 
         r = len(PARAMS) + 1
         tk.Label(tbl, text="Реинвест, %", bg=PANEL, fg=TEXT, font=(FONT, 9)).grid(
@@ -769,12 +779,15 @@ class App:
         self.reinvest.frame.grid(row=r, column=1, columnspan=5, sticky="w")
         self.reinvest_count = tk.Label(tbl, text="1", bg=PANEL, fg=DIM, font=(FONT, 9, "bold"), width=8)
         self.reinvest_count.grid(row=r, column=6)
+        tk.Frame(tbl, bg=LINE, height=1).grid(row=r + 1, column=0, columnspan=7, sticky="ew", pady=(3, 1))
+        self._param_row(tbl, r + 2, STOP_ROW)
 
-        hint(p, "В «Значение» можно несколько через запятую: 10, 20 (дробные — через точку). "
-                "«перебор» — от «от» до «до» включительно с шагом.", wrap=540).pack(fill="x", pady=(6, 0))
+        hint(p, "«Значение» — одно или через запятую (дробные — через точку); «перебор» — от/до/шаг. "
+                "Стоп — % от средней, переносится при доборе, 0 — без стопа; считается по сделкам "
+                "прогона, без новых прогонов на сервере.", wrap=550).pack(fill="x", pady=(4, 0))
 
         fees = tk.Frame(p, bg=PANEL)
-        fees.pack(fill="x", pady=(8, 0))
+        fees.pack(fill="x", pady=(6, 0))
         fees.columnconfigure(0, weight=1, uniform="f")
         fees.columnconfigure(1, weight=1, uniform="f")
         field_label(fees, "Комиссия мейкер, %").grid(row=0, column=0, pady=(0, 3))
@@ -785,10 +798,10 @@ class App:
         self._entry(fees, self.fee_taker).grid(row=1, column=1, sticky="ew", padx=(4, 0))
 
         self.err = hint(p, fg=MINUS, wrap=540)
-        self.err.pack(fill="x", pady=(8, 0))
+        self.err.pack(fill="x", pady=(2, 0))
 
         cnt = tk.Frame(p, bg=TINT, padx=14, pady=10)
-        cnt.pack(fill="x", pady=(6, 0))
+        cnt.pack(fill="x", pady=(4, 0))
         top = tk.Frame(cnt, bg=TINT)
         top.pack(anchor="w")
         self.total_lbl = tk.Label(top, text="—", bg=TINT, fg=ACCENT, font=(FONT, 20, "bold"))
@@ -801,9 +814,9 @@ class App:
         self.eta_lbl.pack(fill="x", pady=(2, 0))
 
         self.run_btn = primary(p, "Запустить прогон", self.start_sweep)
-        self.run_btn.pack(fill="x", pady=(12, 0))
+        self.run_btn.pack(fill="x", pady=(10, 0))
         row = tk.Frame(p, bg=PANEL)
-        row.pack(fill="x", pady=(8, 0))
+        row.pack(fill="x", pady=(6, 0))
         self.resume_btn = ghost(row, "Продолжить досчёт", lambda: self.start_sweep(force=True))
         self.resume_btn.box.pack(side="left")
         self.stop_btn = ghost(row, "■ Стоп", self.stop_cmd)
@@ -811,6 +824,28 @@ class App:
         self.stop_btn.box.pack(side="left", padx=6)
         ghost(row, "Открыть CSV", self.open_csv).box.pack(side="right")
         ghost(row, "Лучшие результаты", self.show_top).box.pack(side="right", padx=6)
+
+    def _param_row(self, tbl, r, spec):
+        key, label, default, lim, isint, (lo, hi, step) = spec
+        tk.Label(tbl, text=label, bg=PANEL, fg=TEXT, font=(FONT, 9)).grid(
+            row=r, column=0, sticky="w", padx=(0, 10), pady=3)
+        row = {"label": label, "limit": lim, "int": isint, "default": default,
+               "value": self._var("%g" % default), "lo": self._var("%g" % lo),
+               "hi": self._var("%g" % hi), "step": self._var("%g" % step)}
+        if key in PRESETS["mid"]:      # правка поля снимает подсветку пресета, как на сайте
+            row["value"].trace_add("write", lambda *_a: self._filling or self.presets.set([]))
+        row["e_value"] = self._entry(tbl, row["value"], width=12)
+        row["e_value"].grid(row=r, column=1, sticky="ew")
+        row["range"] = Toggle(tbl, "перебор", padx=8,
+                              command=lambda t, k=key: self._toggle_range(k))
+        row["range"].grid(row=r, column=2, padx=8)
+        for c, k in ((3, "lo"), (4, "hi"), (5, "step")):
+            row["e_" + k] = self._entry(tbl, row[k], width=7)
+            row["e_" + k].grid(row=r, column=c, padx=(0, 4))
+        row["count"] = tk.Label(tbl, text="1", bg=PANEL, fg=DIM, font=(FONT, 9, "bold"), width=8)
+        row["count"].grid(row=r, column=6)
+        self.rows[key] = row
+        self._row_state(key)
 
     def _toggle_range(self, key):
         row = self.rows[key]
@@ -1243,6 +1278,9 @@ class App:
                 "rate_per_hour": self._pos_int(self.rate_hour, "Прогонов в час"),
                 "output": self.output.get().strip() or "results.csv",
             }
+            stops = self._row_values("stop_loss")
+            if stops != [0]:
+                cfg["stop_loss"] = stops
             if sets:
                 cfg["sets"] = sets
             if indicators:
@@ -1267,23 +1305,25 @@ class App:
     def _out_path(cfg):
         return os.path.join(HERE, cfg["output"])
 
-    def _done_keys(self, path):
-        """gbt.done_keys с кэшем по времени изменения файла."""
+    def _done_pairs(self, path):
+        """gbt.done_pairs с кэшем по времени изменения файла."""
         st = os.stat(path)
         cached = self._done_cache.get(path)
         if cached and cached[:2] == (st.st_mtime, st.st_size):
             return cached[2]
-        keys = gbt.done_keys(path)
-        self._done_cache[path] = (st.st_mtime, st.st_size, keys)
-        return keys
+        pairs = gbt.done_pairs(path)
+        self._done_cache[path] = (st.st_mtime, st.st_size, pairs)
+        return pairs
 
     def _left(self, cfg, jobs):
-        """Сколько комбинаций ещё не посчитано в CSV (как считает gbt.py при досчёте)."""
+        """(осталось прогонов на сервере, досчитать без сервера) — как считает gbt.py при досчёте."""
+        path = self._out_path(cfg)
         try:
-            seen = self._done_keys(self._out_path(cfg))
+            pairs = self._done_pairs(path) if os.path.exists(path) else set()
+            server, local = gbt.plan(cfg, jobs, path, pairs)
         except (OSError, ValueError, KeyError, UnicodeDecodeError):
-            return len(jobs)
-        return sum(1 for key, _, _ in jobs if key not in seen)
+            return len(jobs), 0
+        return len(server), len(local)
 
     # ---------- живой счётчик комбинаций ----------
 
@@ -1294,7 +1334,7 @@ class App:
 
     def _recalc(self):
         self._recalc_id = None
-        for key in PARAM_NAMES:
+        for key in PARAM_NAMES + ["stop_loss"]:
             lbl = self.reinvest_count if key == "reinvest" else self.rows[key]["count"]
             try:
                 n = len(self._row_values(key))
@@ -1337,10 +1377,17 @@ class App:
                   "%d %s" % (n_ent, plural(n_ent, "вход", "входа", "входов")),
                   "%s %s" % (spaced(n_sets), plural(n_sets, "набор", "набора", "наборов"))]
         self.total_lbl.config(text=spaced(total))
-        self.total_word.config(text=plural(total, "комбинация", "комбинации", "комбинаций"))
+        self.total_word.config(text=plural(total, "прогон", "прогона", "прогонов") + " на сервере")
+        n_stop = len(cfg.get("stop_loss", [0]))
         self.parts_lbl.config(text=" × ".join(parts)
                               + ("" if total == n_pairs * n_per * n_side * n_ent * n_sets
-                                 else " (не у всех пар есть история за период)"))
+                                 else " (не у всех пар есть история за период)")
+                              + ("" if n_stop == 1 else
+                                 "\n× %d %s стопа = %s %s в таблице — стоп считается по сделкам, "
+                                 "без новых прогонов" % (
+                                     n_stop, plural(n_stop, "вариант", "варианта", "вариантов"),
+                                     spaced(total * n_stop),
+                                     plural(total * n_stop, "строка", "строки", "строк"))))
         self._show_eta(cfg, total, None)
         path = self._out_path(cfg)
         if os.path.exists(path) and total <= LEFT_LIMIT:
@@ -1360,13 +1407,19 @@ class App:
             self._show_eta(cfg, total, left)
 
     def _show_eta(self, cfg, total, left):
-        n = total if left is None else left
+        """left — (осталось на сервере, без сервера) или None, пока не посчитано."""
+        n, local = (total, 0) if left is None else left
         rpm, rph = cfg["rate_per_min"], cfg["rate_per_hour"]
         eta = gbt.fmt_eta(gbt.eta_minutes(n, rpm, rph))
-        text = "≈ %s (сервер: %d в минуту, %d в час)" % (eta, rpm, rph) if n else "считать нечего"
-        if left is not None and left < total:
+        if n:
+            text = "≈ %s (сервер: %d в минуту, %d в час)" % (eta, rpm, rph)
+        else:
+            text = "на сервере считать нечего" if local else "считать нечего"
+        if local:
+            text += "; ещё %s — новые значения стопа по сохранённым сделкам, без сервера" % spaced(local)
+        if left is not None and n < total:
             text = "В %s уже посчитано %s, осталось %s — %s" % (
-                cfg["output"], spaced(total - left), spaced(left), text)
+                cfg["output"], spaced(total - n), spaced(n), text)
         else:
             text = "Файл: %s · %s" % (cfg["output"], text)
         self.eta_lbl.config(text=text)
@@ -1390,19 +1443,20 @@ class App:
             messagebox.showerror("Настройки", "Нулевое число прогонов — проверьте настройки")
             return
         if os.path.exists(self._out_path(cfg)):
-            left = self._left(cfg, jobs)
-            if left == 0:
+            left, local = self._left(cfg, jobs)
+            if left == 0 and local == 0:
                 messagebox.showinfo("Прогон", "Все %d комбинаций уже посчитаны в %s."
                                     % (n, cfg["output"]))
                 return
+            extra = (" (+%d — только новый стоп, без сервера)" % local) if local else ""
             if force:
-                self.say("Досчёт в %s: осталось %d из %d — продолжаю без вопросов."
-                         % (cfg["output"], left, n))
+                self.say("Досчёт в %s: осталось %d из %d%s — продолжаю без вопросов."
+                         % (cfg["output"], left, n, extra))
             elif not messagebox.askyesno(
                     "Прогон",
                     "Файл %s уже есть: посчитано %d из %d.\n"
-                    "Продолжить досчёт оставшихся %d?\n(Да — продолжить, Нет — отмена)"
-                    % (cfg["output"], n - left, n, left)):
+                    "Продолжить досчёт оставшихся %d%s?\n(Да — продолжить, Нет — отмена)"
+                    % (cfg["output"], n - left, n, left, extra)):
                 return
         elif force:
             self.say("Файла %s ещё нет — считаю с начала." % cfg["output"])
@@ -1527,7 +1581,8 @@ class App:
             self.entry_hold.set(fmt_vals(gbt.as_list(cfg.get("entry_hold", 60))))
 
             defaults, grid = cfg.get("defaults", {}), cfg.get("grid", {})
-            for key in PARAM_NAMES:
+            grid = dict(grid, stop_loss=gbt.as_list(cfg.get("stop_loss", [0])))
+            for key in PARAM_NAMES + ["stop_loss"]:
                 if key in grid:
                     vals = gbt.as_list(grid[key])
                 elif key in defaults:
