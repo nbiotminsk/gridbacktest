@@ -91,7 +91,12 @@ if has_stop:
         by[float(r["stop_loss"]) if r.get("stop_loss") else 0.0].append(r)
     for st, rs in sorted(by.items()):
         ok = [r for r in rs if not r["liq"]]
+        part = sum(1 for r in rs if gbt.partial(r))
         hits = [int(r.get("stop_hits") or 0) for r in rs]
-        print("  %-10s выжило %3d/%-3d  стопов в среднем %5.1f  лучший %+9.1f%%  средний %+9.1f%%"
-              % ("%g%%" % st if st else "без стопа", len(ok), len(rs), sum(hits) / len(rs),
-                 max(r["np"] for r in rs), sum(r["np"] for r in rs) / len(rs)))
+        print("  %-10s выжило %3d/%-3d  неполных %3d  стопов в среднем %5.1f  лучший %s  средний %s"
+              % ("%g%%" % st if st else "без стопа", len(ok), len(rs), part, sum(hits) / len(rs),
+                 "%+9.1f%%" % max(r["np"] for r in ok) if ok else "        —",
+                 "%+9.1f%%" % (sum(r["np"] for r in ok) / len(ok)) if ok else "        —"))
+    if any(gbt.partial(r) for r in rows):
+        print("  неполные — стоп сработал бы раньше ликвидации, но дальше неё сервер не считал;\n"
+              "  лучший и средний итог — только по выжившим за весь период.")

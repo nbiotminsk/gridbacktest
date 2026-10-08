@@ -639,13 +639,20 @@ def result_rows(row, out, stops):
 
 
 def effective(r):
-    """(итог %, ликвидация?) строки CSV с учётом оценки стопа (по точным стопам).
-    Со стопом «ликвидация» — это и депозит, кончившийся на стопах (stop_wiped)."""
+    """(итог %, исключить из лучших?) строки CSV с учётом оценки стопа (по точным стопам).
+
+    Исключаются: ликвидация; депозит, кончившийся на стопах (stop_wiped); и неполные — стоп
+    сработал бы раньше ликвидации (liq_avoided), но после ликвидации сервер не считал, так что
+    итог известен только до её даты, а не за весь период."""
     if r.get("stop_loss") and r.get("net_stop_pct") not in (None, ""):
-        return float(r["net_stop_pct"]), ((r.get("liquidated") == "True"
-                                           and r.get("liq_avoided") != "True")
+        return float(r["net_stop_pct"]), (r.get("liquidated") == "True"
                                           or r.get("stop_wiped") not in (None, "", "False"))
     return float(r["net_pct"]), r.get("liquidated") == "True"
+
+
+def partial(r):
+    """Строка со стопом, итог которой известен только до даты ликвидации (см. effective)."""
+    return bool(r.get("stop_loss")) and r.get("liq_avoided") == "True"
 
 
 # ---------- прогон ----------
@@ -853,11 +860,14 @@ def cmd_sweep(args):
     LIMITER.per_min = max(1, int(cfg.get("rate_per_min", 18)))
     LIMITER.per_hour = max(1, int(cfg.get("rate_per_hour", 145)))
     n_done = len(jobs) - len(todo)       # на сервере; local — только новые значения стопа
+    used = rate_usage()
+    workers = max(1, int(args.workers or cfg.get("workers", 2)))
     print("Комбинаций всего: %d, уже посчитано: %d, осталось: %d (примерно %s: сервер даёт %d прогонов "
-          "в минуту и %d в час)"
+          "в минуту и %d в час%s)"
           % (len(jobs), n_done, len(todo),
-             fmt_eta(eta_minutes(len(todo), LIMITER.per_min, LIMITER.per_hour)),
-             LIMITER.per_min, LIMITER.per_hour))
+             fmt_eta(eta_minutes(len(todo), LIMITER.per_min, LIMITER.per_hour, used, workers)),
+             LIMITER.per_min, LIMITER.per_hour,
+             ", за последний час уже %d" % used[1] if used[1] else ""))
     if any(stops):
         print("Стоп-лосс: %s %% от средней цены — %d %s на каждый прогон, сервер их не считает "
               "(оценка по сделкам, новых прогонов не нужно)"
@@ -962,7 +972,9 @@ def cmd_sweep(args):
                         tag += " | стоп %s%%: %s%s, итог %+.2f%%%s" % (
                             r["stop_loss"], r["stop_hits"],
                             " (+%s?)" % r["stop_maybe"] if r["stop_maybe"] else "",
-                            r["net_stop_pct"], ", без ликвидации" if r["liq_avoided"] else "")
+                            r["net_stop_pct"],
+                            " (неполный: стоп до ликвидации, дальше сервер не считал)"
+                            if r["liq_avoided"] else "")
                 print("[%d/%d] %s | %s %s ov%s ord%s pf%s vf%s tp%s | %s | ETA %dм"
                       % (n, len(todo), tag, row["symbol"], row["position"], row["price_overlap"],
                          row["orders"], row["price_factor"], row["volume_factor"], row["profit"],
@@ -997,17 +1009,37 @@ def entry_name(row):
     return row["entry"]                            # своё правило: tf уже в подписи
 
 
-def eta_minutes(n, per_min, per_hour):
-    """Сколько минут займут n прогонов при лимитах сервера (если за последний час прогонов не было).
+RUN_SECONDS = 2.0   # сколько в среднем идёт один прогон (замер 09.10.2026: 0.2–3 с, по 2 потока)
 
-    Лимиты скользящие: до per_hour прогонов идут подряд, по per_min в минуту; дальше каждая
-    следующая порция ждёт, пока первые прогоны часа «выйдут» из окна.
+
+def rate_usage():
+    """(прогонов за последнюю минуту, за последний час) — по rate.json, общий на все запуски."""
+    try:
+        with open(RATE_FILE, encoding="utf-8") as f:
+            stamps = json.load(f)
+    except (OSError, ValueError):
+        return 0, 0
+    now = time.time()
+    return sum(now - t < 60 for t in stamps), sum(now - t < 3600 for t in stamps)
+
+
+def eta_minutes(n, per_min, per_hour, used=None, workers=2):
+    """Сколько минут займут n прогонов при лимитах сервера.
+
+    Лимиты скользящие: до per_hour прогонов за час идут подряд, по per_min в минуту; дальше
+    каждая следующая порция ждёт, пока первые прогоны часа «выйдут» из окна. used — уже
+    израсходовано (за минуту, за час), см. rate_usage; плюс время самих прогонов.
     """
     if n <= 0:
         return 0
-    hours = (n - 1) // per_hour
-    rest = n - hours * per_hour
-    return hours * 60 + (rest - 1) // per_min
+    used_min, used_hour = used or (0, 0)
+    now_ok = max(0, per_hour - used_hour)          # можно ещё в этом часе
+    if n <= now_ok:
+        mins = (n + min(used_min, per_min) - 1) // per_min
+    else:
+        rest = n - now_ok
+        mins = ((rest - 1) // per_hour + 1) * 60 + ((rest - 1) % per_hour) // per_min
+    return mins + n * RUN_SECONDS / max(1, workers) / 60
 
 
 def fmt_eta(mins):
@@ -1045,7 +1077,8 @@ def show_top(path, limit, allow_liq=False, by="net_pct"):
                     continue
             rows.append(r)
     if not rows and liq:
-        print("\nВсе %d прогонов закончились ликвидацией — показываю их:" % liq)
+        print("\nВсе %d вариантов с ликвидацией (или неполные — стоп до ликвидации) — показываю их:"
+              % liq)
         return show_top(path, limit, True, by)
     has_stop = any(r.get("stop_loss") for r in rows)
     sort_key = {"net_pct": lambda r: r["_net"]}.get(by, lambda r: float(r[by]))
@@ -1066,9 +1099,11 @@ def show_top(path, limit, allow_liq=False, by="net_pct"):
         liq_note = ""
         if r.get("stop_wiped") not in (None, "", "False"):
             liq_note = "  ДЕПОЗИТ КОНЧИЛСЯ НА СТОПАХ %s" % r["stop_wiped"]
+        elif partial(r):
+            liq_note = ("  НЕПОЛНЫЙ: стоп спас бы от ликвидации %s, дальше сервер не считал"
+                        % fmt_time(r.get("liq_time")))
         elif r.get("liquidated") == "True":
-            liq_note = ("  без ликвидации: стоп раньше %s" if r.get("liq_avoided") == "True"
-                        else "  ЛИКВИДАЦИЯ %s") % fmt_time(r.get("liq_time"))
+            liq_note = "  ЛИКВИДАЦИЯ %s" % fmt_time(r.get("liq_time"))
         print("%-12s %-7s %6s %5s %5s %5s %5s %4s%s %9.2f %8s %6s  %s%s"
               % (r["symbol"], r["position"], r["price_overlap"], r["orders"], r["price_factor"],
                  r["volume_factor"], r["profit"], r["leverage"], stop, r["_net"],
@@ -1076,7 +1111,7 @@ def show_top(path, limit, allow_liq=False, by="net_pct"):
     if not rows:
         print("  (нет посчитанных строк)")
     elif liq and not allow_liq:
-        print("Скрыто с ликвидацией: %d (показать: python gbt.py top %s --with-liq)"
+        print("Скрыто с ликвидацией и неполных: %d (показать: python gbt.py top %s --with-liq)"
               % (liq, os.path.basename(path)))
 
 

@@ -412,7 +412,7 @@ class Results(tk.Toplevel):
         self.summary = hint(self, wrap=1200, fg=TEXT)
         self.summary.pack(fill="x")
         self.with_liq = tk.BooleanVar(value=False)
-        ttk.Checkbutton(self, text="Показывать ликвидированные", variable=self.with_liq,
+        ttk.Checkbutton(self, text="Показывать ликвидированные и неполные", variable=self.with_liq,
                         command=self._fill).pack(anchor="w", pady=(6, 6))
 
         box = tk.Frame(self, bg=FIELD)
@@ -452,8 +452,9 @@ class Results(tk.Toplevel):
                         r["liq_time"] = "депозит кончился на стопах %s" % str(r["stop_wiped"])[:10]
                     elif r.get("liquidated") != "True":
                         r["liq_time"] = ""
-                    elif r.get("liq_avoided") == "True":
-                        r["liq_time"] = "нет: стоп до %s" % str(gbt.fmt_time(r.get("liq_time")))[:10]
+                    elif gbt.partial(r):
+                        r["liq_time"] = "неполный: стоп до ликвидации %s" % str(
+                            gbt.fmt_time(r.get("liq_time")))[:10]
                     else:
                         r["liq_time"] = gbt.fmt_time(r.get("liq_time"))
                     if r.get("stop_loss"):
@@ -469,10 +470,16 @@ class Results(tk.Toplevel):
         if self.rows and not alive:
             self.with_liq.set(True)       # иначе таблица была бы пустой
         plus = sum(1 for r in alive if r["_net"] > 0)
+        part = sum(1 for r in self.rows if gbt.partial(r))
         self.summary.config(text="Вариантов: %d · без ликвидации: %d · в плюсе без ликвидации: %d · "
-                                 "с ликвидацией: %d · с ошибкой: %d"
-                                 % (len(self.rows), len(alive), plus, len(self.rows) - len(alive),
-                                    self.errors), fg=TEXT)
+                                 "с ликвидацией: %d · неполных: %d · с ошибкой: %d"
+                                 % (len(self.rows), len(alive), plus,
+                                    len(self.rows) - len(alive) - part, part, self.errors), fg=TEXT)
+        if part:
+            self.summary.config(text=self.summary["text"] + "\nНеполные — стоп сработал бы раньше "
+                                "ликвидации, но после ликвидации сервер не считал: итог только до её "
+                                "даты. Чтобы увидеть весь период — уменьшите плечо или увеличьте "
+                                "перекрытие, чтобы прогон обходился без ликвидации.")
         self._fill()
 
     def _sort(self, key):
@@ -1410,9 +1417,11 @@ class App:
         """left — (осталось на сервере, без сервера) или None, пока не посчитано."""
         n, local = (total, 0) if left is None else left
         rpm, rph = cfg["rate_per_min"], cfg["rate_per_hour"]
-        eta = gbt.fmt_eta(gbt.eta_minutes(n, rpm, rph))
+        used = gbt.rate_usage()
+        eta = gbt.fmt_eta(gbt.eta_minutes(n, rpm, rph, used, cfg["workers"]))
         if n:
-            text = "≈ %s (сервер: %d в минуту, %d в час)" % (eta, rpm, rph)
+            text = "≈ %s (сервер: %d в минуту, %d в час%s)" % (
+                eta, rpm, rph, "; за последний час уже %d" % used[1] if used[1] else "")
         else:
             text = "на сервере считать нечего" if local else "считать нечего"
         if local:
