@@ -11,6 +11,7 @@ from collections import defaultdict
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.dont_write_bytecode = True   # без __pycache__ в корне: там только программа
 import gbt  # noqa: E402
 from gbt import entry_name  # noqa: E402
 

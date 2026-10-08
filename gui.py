@@ -26,6 +26,7 @@ from tkinter import filedialog, messagebox, ttk
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+sys.dont_write_bytecode = True   # без __pycache__ в корне: там только программа
 
 import gbt  # noqa: E402
 
