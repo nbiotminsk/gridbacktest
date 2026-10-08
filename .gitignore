@@ -1,0 +1,11 @@
+# авторизация на gridbacktest.com (куки входа через Telegram) — не публиковать
+session.json
+
+# служебное: счётчик лимита, флаг «Стоп», конфиг, который GUI пишет при каждом запуске
+rate.json
+rate.json.tmp
+.gbt_stop
+sweep_gui.json
+
+__pycache__/
+*.pyc

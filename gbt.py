@@ -1,0 +1,868 @@
+#!/usr/bin/env python3
+"""Массовый прогон бэктестов gridbacktest.com.
+
+  python gbt.py login                    вход через Telegram, сессия -> session.json
+  python gbt.py me                       кто вошёл и открыты ли итоги
+  python gbt.py info                     пары, связки входа, лимиты параметров
+  python gbt.py sweep sweep.json         прогнать все комбинации из конфига
+  python gbt.py sweep sweep.json --dry-run   только посчитать число прогонов
+  python gbt.py top results.csv          лучшие результаты
+
+Прогон можно прервать (Ctrl+C) и запустить снова той же командой —
+уже посчитанные комбинации пропускаются.
+"""
+
+import argparse
+import copy
+import csv
+import hashlib
+import itertools
+import json
+import os
+import sys
+import threading
+import time
+import webbrowser
+from calendar import monthrange
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+import requests
+
+BASE = "https://gridbacktest.com"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) gbt-sweep/1.0"
+HERE = os.path.dirname(os.path.abspath(__file__))
+SESSION_FILE = os.path.join(HERE, "session.json")
+
+PARAM_KEYS = ["deposit", "leverage", "orders", "price_overlap", "price_factor",
+              "volume_factor", "profit", "reinvest"]
+# поле by_trades -> колонка CSV (profit/loss переименованы: profit — это ещё и тейк в параметрах)
+RESULT_COLS = {"net": "net", "net_pct": "net_pct", "max_drawdown": "max_drawdown",
+               "liquidated": "liquidated", "liq_time": "liq_time", "entries": "entries",
+               "cycles": "cycles", "profit": "gross_profit", "loss": "gross_loss", "fees": "fees",
+               "funding": "funding", "stops": "stops", "orders_filled": "orders_filled",
+               "deepest_level": "deepest_level", "open_at_end": "open_at_end"}
+CSV_COLS = (["key", "symbol", "position", "from", "to", "months", "entry", "entry_tf",
+             "swing_level", "chart_tf"] + PARAM_KEYS + ["fee_maker", "fee_taker"]
+            + list(RESULT_COLS.values()) + ["seconds", "error"])
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)  # лог в файл — построчно
+
+
+# ---------- сессия ----------
+
+def new_session():
+    s = requests.Session()
+    s.headers["User-Agent"] = UA
+    return s
+
+
+def save_session(s):
+    jar = [{"name": c.name, "value": c.value, "domain": c.domain, "path": c.path,
+            "expires": c.expires, "secure": c.secure} for c in s.cookies]
+    with open(SESSION_FILE, "w", encoding="utf-8") as f:
+        json.dump(jar, f, indent=1)
+
+
+def load_session():
+    s = new_session()
+    if os.path.exists(SESSION_FILE):
+        with open(SESSION_FILE, encoding="utf-8") as f:
+            for c in json.load(f):
+                s.cookies.set(c["name"], c["value"], domain=c["domain"], path=c["path"],
+                              expires=c.get("expires"), secure=c.get("secure", True))
+    return s
+
+
+def clone_session(src):
+    s = new_session()
+    s.cookies.update(src.cookies)
+    return s
+
+
+def get_me(s, fresh=False):
+    r = s.get(BASE + "/api/me" + ("?fresh=1" if fresh else ""), timeout=30)
+    try:
+        return r.json() or {}
+    except ValueError:
+        return {}
+
+
+def cmd_login(_args):
+    s = new_session()
+    out = s.post(BASE + "/api/login/start", json={}, timeout=30).json()
+    if not out.get("link"):
+        sys.exit("Сервер не выдал ссылку входа: %s" % out)
+    print("Откройте ссылку в Telegram и нажмите «Старт»:\n\n  %s\n" % out["link"])
+    if out.get("backup"):
+        print("Если бот не отвечает — запасной:\n  %s\n" % out["backup"])
+    try:
+        webbrowser.open(out["link"])
+    except Exception:
+        pass
+    print("Ждём подтверждения (до 2 минут)…")
+    deadline = time.time() + 125
+    while time.time() < deadline:
+        time.sleep(2)
+        st = s.post(BASE + "/api/login/poll", json={"nonce": out["nonce"]}, timeout=30).json()
+        if st.get("status") == "ok":
+            break
+        if st.get("status") == "expired" or st.get("error"):
+            sys.exit("Вход не удался: %s" % (st.get("error") or "ссылка устарела"))
+    else:
+        sys.exit("Не дождались «Старт» в Telegram — запустите login ещё раз.")
+    save_session(s)
+    print("Вход выполнен, сессия сохранена в %s" % SESSION_FILE)
+    # сервер проверяет реферала/активного бота не сразу — до двух минут
+    me = get_me(s, fresh=True)
+    for _ in range(12):
+        if me.get("bots") != "wait":
+            break
+        print("Сервер проверяет аккаунт…")
+        time.sleep(10)
+        me = get_me(s)
+    save_session(s)
+    print_me(me)
+
+
+def print_me(me):
+    if not me.get("id"):
+        print("Не вошли (или сессия истекла). Войдите: пункт 1 в run.bat или python gbt.py login")
+        return
+    print("Аккаунт: %s (id %s)  статус ботов: %s" % (me.get("name"), me.get("id"), me.get("bots")))
+    if me.get("bots") == "active":
+        print("Итоги открыты — можно запускать sweep.")
+    else:
+        print("ВНИМАНИЕ: итоги закрыты (нужен активный бот Pifagor) — сервер будет отдавать нули.")
+
+
+def cmd_me(_args):
+    print_me(get_me(load_session(), fresh=True))
+
+
+# ---------- справочник сайта ----------
+
+def get_data(s):
+    return s.get(BASE + "/api/data", timeout=60).json()
+
+
+def cmd_info(_args):
+    d = get_data(new_session())
+    print("Пары (первый месяц — последний, всего месяцев):")
+    for p, m in sorted(d["pairs"].items()):
+        print("  %-14s %s — %s  (%d)" % (p, m[0], m[-1], len(m)))
+    print("\nСвязки входа (entries):")
+    for t in d["templates"]:
+        print("  %-11s long: %s | short: %s" % (t["id"], t["long"]["name"], t["short"]["name"]))
+    print("\nИндикаторы для своих правил (indicators): id, параметры по умолчанию, норма long | short")
+    for c in d["catalog"]:
+        n = d["norms"].get(c["id"], {})
+        side = lambda k: ("%s %s" % (n[k]["op"], n[k].get("value", "")) if k in n else "")
+        print("  %-12s %-34s %-40s %s | %s" % (
+            c["id"], c["name"], json.dumps(c.get("defaults", {}), ensure_ascii=False),
+            side("long"), side("short")))
+        if c.get("lines"):
+            print("  %-12s line: %s" % ("", ", ".join(c["lines"])))
+    lim = d["entry_limits"]
+    print("  лимиты: period %s, mult %s, hours %s, shift %s; до %d групп ИЛИ, до %d условий И"
+          % (lim["period"], lim["mult"], lim["hours"], lim["shift"], lim["groups"], lim["filters"]))
+    print("\nИнтервалы связок (entry_tfs):", d["entry_tfs"])
+    print("Интервалы графика (chart_tf):", d["chart_tfs"])
+    print("\nЛимиты параметров:")
+    for k, v in d["limits"].items():
+        print("  %-14s %s" % (k, v))
+    print("  reinvest — только 0 / 25 / 50 / 100")
+
+
+# ---------- построение прогонов ----------
+
+def month_edge(month, end):
+    y, m = map(int, month.split("-"))
+    return "%04d-%02d-%02d" % (y, m, monthrange(y, m)[1] if end else 1)
+
+
+def period_for(all_months, spec):
+    """(from, to, months) для пары. spec: {"years": N} или {"from": .., "to": ..}."""
+    if "years" in spec:
+        months = all_months[-min(len(all_months), int(spec["years"]) * 12):]
+        if not months:
+            return None
+        return month_edge(months[0], False), month_edge(months[-1], True), months
+    lo = spec.get("from") or month_edge(all_months[0], False)
+    hi = spec.get("to") or month_edge(all_months[-1], True)
+    months = [m for m in all_months if lo[:7] <= m <= hi[:7]]
+    if not months:
+        return None
+    # не начинаем раньше истории пары и не заканчиваем позже неё
+    lo = max(lo, month_edge(months[0], False))
+    hi = min(hi, month_edge(months[-1], True))
+    return lo, hi, months
+
+
+def as_list(v):
+    return v if isinstance(v, list) else [v]
+
+
+def entry_tfs_of(cfg, data):
+    tfs = cfg.get("entry_tfs", [60])
+    return data["entry_tfs"] if tfs == "all" else as_list(tfs)
+
+
+FLIP_OP = {"lt": "gt", "gt": "lt", "cross_up": "cross_down", "cross_down": "cross_up"}
+# параметры индикатора, которые можно перебирать списком (кроме tf/op/value)
+IND_KEYS = ["period", "mult", "line", "method", "price", "hours", "shift"]
+SHORT_IND = {"drawdown": "runup", "runup": "drawdown"}
+
+
+def num_text(v):
+    return ("%g" % v) if isinstance(v, float) else str(v)
+
+
+def leaf_variants(spec, side, cfg, data):
+    """Один фильтр-индикатор -> [(подпись, [[filter]])] по всем комбинациям его списков.
+
+    value/op задаются для лонга; для шорта берутся short_value/short_op, а если их нет —
+    зеркально по норме сайта (RSI ниже 30 -> выше 70, CCI ниже −100 -> выше +100);
+    у индикаторов, где норма одна для обеих сторон (ADX, всплеск объёма), — как есть.
+    drawdown в шорте сам становится runup (как у связки swing); иначе — short_ind.
+    """
+    short = side == "short"
+    ind = spec["ind"]
+    if short:   # как у связки swing: в лонг — откат от максимума, в шорт — отскок от минимума
+        ind = spec.get("short_ind", SHORT_IND.get(ind, ind))
+    meta = next((c for c in data["catalog"] if c["id"] == ind), None)
+    if not meta:
+        sys.exit("Неизвестный индикатор: %s (см. python gbt.py info)" % ind)
+    norm = data["norms"].get(ind, {})
+    vs_price = ind in ("bb", "ma")         # полосы/средняя сравниваются с ценой, а не с числом
+    same_norm = norm.get("long", {}).get("op") == norm.get("short", {}).get("op")
+
+    axes = {"tf": as_list(spec.get("tf", entry_tfs_of(cfg, data)))}
+    for k in IND_KEYS:
+        if k in spec:
+            axes[k] = as_list(spec[k])
+    for k in ("op", "value"):
+        if short and ("short_" + k) in spec:
+            axes["short_" + k] = as_list(spec["short_" + k])
+        elif k in spec:
+            axes[k] = as_list(spec[k])
+
+    out = []
+    for combo in itertools.product(*axes.values()):
+        a = dict(zip(axes, combo))
+        ip = {k: a[k] for k in IND_KEYS if k in a}
+        if "short_op" in a:
+            op = a["short_op"]
+        elif "op" in a:
+            op = a["op"] if (not short or same_norm) else FLIP_OP.get(a["op"], a["op"])
+        elif vs_price:
+            op = "gt" if short else "lt"
+        else:
+            op = norm[side]["op"]
+        if vs_price:
+            if ind == "bb" and "line" not in ip:
+                ip["line"] = "upper" if short else "lower"
+            f = {"left": {"ind": "price"}, "op": op,
+                 "right": dict({"type": "ind", "ind": ind}, **ip), "tf": a["tf"]}
+            label = "price %s %s(%s)" % (op, ind, ",".join(num_text(v) for v in ip.values()))
+        else:
+            if "short_value" in a:
+                value = a["short_value"]
+            elif "value" in a:
+                value = a["value"]
+                if short and not same_norm:
+                    lo, hi = meta.get("scale", [0, 0])
+                    value = round(lo + hi - value, 6)
+            else:
+                value = norm[side]["value"]
+            f = {"left": dict({"ind": ind}, **ip), "op": op,
+                 "right": {"type": "const", "value": value}, "tf": a["tf"]}
+            label = "%s(%s) %s %s" % (ind, ",".join(num_text(v) for v in ip.values()),
+                                     op, num_text(value))
+        out.append(("%s @%s" % (label, a["tf"]), [[f]]))
+    return out
+
+
+def expand_rule(spec, side, cfg, data):
+    """Правило входа -> [(подпись, groups)], groups — «ИЛИ» групп, внутри группы «И».
+
+    spec: {"ind": ...} | {"all": [spec, ...]} (И) | {"any": [spec, ...]} (ИЛИ)
+    """
+    if "ind" in spec:
+        return leaf_variants(spec, side, cfg, data)
+    key = "all" if "all" in spec else "any" if "any" in spec else None
+    if not key:
+        sys.exit("Правило входа должно содержать ind, all или any: %s" % spec)
+    parts = [expand_rule(s, side, cfg, data) for s in spec[key]]
+    out = []
+    for combo in itertools.product(*parts):
+        if key == "all":       # (A1|A2) & (B1|B2) = A1&B1 | A1&B2 | ...
+            groups = [[]]
+            for _, g in combo:
+                groups = [x + y for x in groups for y in g]
+            label = " & ".join(("(%s)" % l) if " | " in l else l for l, _ in combo)
+        else:
+            groups = [g for _, gs in combo for g in gs]
+            label = " | ".join(l for l, _ in combo)
+        out.append((label, groups))
+    return out
+
+
+def entry_variants(cfg, data, position):
+    """Список (подпись, tf, swing_level, entry) для стороны сделки."""
+    names = cfg.get("entries", [] if "indicators" in cfg else ["none"])
+    tpls = {t["id"]: t for t in data["templates"]}
+    if names == "all":
+        names = ["none"] + list(tpls)
+    tfs = entry_tfs_of(cfg, data)
+    holds = as_list(cfg.get("entry_hold", 60))
+    lim = data["entry_limits"]
+    out = []
+    for name in names:
+        if name == "none":
+            out.append(("none", None, None, {"kind": "none"}))
+            continue
+        if name not in tpls:
+            sys.exit("Неизвестная связка входа: %s (см. python gbt.py info)" % name)
+        levels = as_list(cfg.get("swing_levels", [1])) if name == "swing" else [None]
+        for tf, lvl, hold in itertools.product(tfs, levels, holds):
+            f = copy.deepcopy(tpls[name][position]["filter"])
+            f["tf"] = tf
+            f["tpl"] = name
+            if lvl is not None:
+                f["right"]["value"] = lvl
+            out.append((name, tf, lvl, {"kind": "rules", "hold": hold,
+                                        "groups": [{"filters": [f]}]}))
+    for spec in cfg.get("indicators", []):
+        for label, groups in expand_rule(spec, position, cfg, data):
+            if len(groups) > lim["groups"] or any(len(g) > lim["filters"] for g in groups):
+                sys.exit("Правило «%s» больше лимита сайта: до %d групп «ИЛИ» и до %d условий «И»"
+                         % (label, lim["groups"], lim["filters"]))
+            for hold in holds:
+                out.append((label, None, None, {"kind": "rules", "hold": hold,
+                                                "groups": [{"filters": g} for g in groups]}))
+    return out
+
+
+def param_sets(cfg):
+    """Комбинации параметров сетки: декартово произведение grid + явные sets."""
+    grid = cfg.get("grid", {})
+    sets = []
+    if grid:
+        keys = list(grid)
+        for vals in itertools.product(*[v if isinstance(v, list) else [v] for v in grid.values()]):
+            sets.append(dict(zip(keys, vals)))
+    sets += cfg.get("sets", [])
+    base = {"deposit": 1000, "leverage": 10, "orders": 10, "price_overlap": 25,
+            "price_factor": 1.6, "volume_factor": 1.2, "profit": 1, "reinvest": 0}
+    base.update(cfg.get("defaults", {}))
+    return [dict(base, **s) for s in sets] or [base]
+
+
+def check_limits(p, limits):
+    for k, v in p.items():
+        lim = limits.get(k)
+        if lim and not (lim[0] <= v <= lim[1]):
+            return "%s=%s вне [%s, %s]" % (k, v, lim[0], lim[1])
+    if p.get("reinvest") not in (0, 25, 50, 100):
+        return "reinvest должен быть 0/25/50/100"
+    return None
+
+
+def build_jobs(cfg, data):
+    symbols = cfg.get("symbols", ["BTCUSDT"])
+    if symbols == "all":
+        symbols = sorted(data["pairs"])
+    positions = cfg.get("positions", ["long"])
+    periods = cfg.get("periods", [{"years": 4}])
+    chart_tfs = cfg.get("chart_tfs", [60])
+    chart_tfs = data["chart_tfs"] if chart_tfs == "all" else as_list(chart_tfs)
+    fees = cfg.get("fees", {"fee_maker": 0.0002, "fee_taker": 0.0005})
+    psets = param_sets(cfg)
+    for p in psets:
+        bad = check_limits(dict(p, **fees), data["limits"])
+        if bad:
+            sys.exit("Недопустимый набор параметров %s: %s" % (p, bad))
+
+    jobs = []
+    for sym in symbols:
+        if sym not in data["pairs"]:
+            sys.exit("Нет такой пары: %s" % sym)
+        for spec in periods:
+            per = period_for(data["pairs"][sym], spec)
+            if not per:
+                continue
+            lo, hi, months = per
+            for pos in positions:
+                for ename, etf, lvl, entry in entry_variants(cfg, data, pos):
+                    # интервал графика влияет на счёт только при входе без условий
+                    for ctf in (chart_tfs if ename == "none" else [chart_tfs[0]]):
+                        for p in psets:
+                            params = dict(p, position=pos, **fees)
+                            req = {"symbol": sym, "months": months, "from": lo, "to": hi,
+                                   "params": params, "entry": entry, "chart_tf": ctf}
+                            key = hashlib.sha1(json.dumps(req, sort_keys=True).encode()).hexdigest()[:16]
+                            row = {"key": key, "symbol": sym, "position": pos, "from": lo, "to": hi,
+                                   "months": len(months), "entry": ename, "entry_tf": etf or "",
+                                   "swing_level": "" if lvl is None else lvl, "chart_tf": ctf}
+                            row.update({k: params[k] for k in PARAM_KEYS})
+                            row.update(fees)
+                            jobs.append((key, req, row))
+    return jobs
+
+
+def count_jobs(cfg, data):
+    """Сколько прогонов даст build_jobs — без сборки запросов (быстро, для счётчика в GUI)."""
+    symbols = cfg.get("symbols", ["BTCUSDT"])
+    if symbols == "all":
+        symbols = sorted(data["pairs"])
+    chart_tfs = cfg.get("chart_tfs", [60])
+    chart_tfs = data["chart_tfs"] if chart_tfs == "all" else as_list(chart_tfs)
+    grid = cfg.get("grid", {})
+    n_sets = len(cfg.get("sets", []))
+    if grid:
+        n = 1
+        for v in grid.values():
+            n *= len(as_list(v))
+        n_sets += n
+    n_sets = n_sets or 1
+    per_pair = 0
+    for pos in cfg.get("positions", ["long"]):
+        per_pair += sum(len(chart_tfs) if e[0] == "none" else 1
+                        for e in entry_variants(cfg, data, pos))
+    total = 0
+    for sym in symbols:
+        if sym not in data["pairs"]:
+            sys.exit("Нет такой пары: %s" % sym)
+        for spec in cfg.get("periods", [{"years": 4}]):
+            if period_for(data["pairs"][sym], spec):
+                total += per_pair * n_sets
+    return total
+
+
+# ---------- прогон ----------
+
+class Stop(Exception):
+    pass
+
+
+ALLOW_LOCKED = False   # --force: считать и с закрытыми итогами (для проверки конфига)
+STOP = threading.Event()   # остановка прогона: Ctrl+C или кнопка «Стоп» в GUI (файл GBT_STOP_FILE)
+
+
+RATE_FILE = os.path.join(HERE, "rate.json")
+
+
+class RateLimiter:
+    """Лимиты сервера на прогоны — общий счётчик на все потоки.
+
+    Замер 07.10.2026: не больше 20 прогонов в минуту (21-й — 429 «слишком часто,
+    подождите минуту») и не больше 150 за последний час (429 «лимит 150»,
+    с Retry-After). Время прогонов хранится в rate.json, чтобы перезапуск
+    скрипта не обнулял часовой счёт — сервер его не обнуляет.
+    """
+
+    def __init__(self, per_min=18, per_hour=145):
+        self.per_min, self.per_hour = per_min, per_hour
+        self.stamps = deque()
+        self.block_until = 0.0
+        self.said_until = 0.0
+        self.lock = threading.Lock()
+        try:
+            with open(RATE_FILE, encoding="utf-8") as f:
+                self.stamps.extend(sorted(json.load(f)))
+        except (OSError, ValueError):
+            pass
+
+    def _wait(self, now):
+        while self.stamps and now - self.stamps[0] >= 3600:
+            self.stamps.popleft()
+        pause = self.block_until - now
+        for span, limit in ((60, self.per_min), (3600, self.per_hour)):
+            inside = [t for t in self.stamps if now - t < span]
+            if len(inside) >= limit:
+                pause = max(pause, inside[len(inside) - limit] + span - now + 0.5)
+        return pause
+
+    def acquire(self):
+        while True:
+            if STOP.is_set():
+                raise Stop("остановлено по запросу")
+            with self.lock:
+                now = time.time()
+                pause = self._wait(now)
+                if pause <= 0:
+                    self.stamps.append(now)
+                    try:   # через временный файл — обрыв посреди записи не портит rate.json
+                        tmp = RATE_FILE + ".tmp"
+                        with open(tmp, "w", encoding="utf-8") as f:
+                            json.dump(list(self.stamps), f)
+                        os.replace(tmp, RATE_FILE)
+                    except OSError:
+                        pass
+                    return
+                if pause > 90 and now + pause > self.said_until + 60:
+                    self.said_until = now + pause
+                    print("  …часовой лимит сервера (%d прогонов/ч): ждём %d мин, до %s"
+                          % (self.per_hour, pause // 60 + 1,
+                             time.strftime("%H:%M", time.localtime(now + pause))))
+            STOP.wait(min(pause, 5))
+
+    def penalize(self, seconds=None):
+        with self.lock:
+            seconds = max(61, seconds or 0)
+            if self.block_until <= time.time():
+                print("  …сервер просит подождать %d мин (лимит), ждём до %s"
+                      % ((seconds + 59) // 60,
+                         time.strftime("%H:%M", time.localtime(time.time() + seconds))))
+            self.block_until = max(self.block_until, time.time() + seconds)
+
+
+LIMITER = RateLimiter()   # у сервера 20/мин и 150/ч — держим с запасом
+_local = threading.local()
+
+
+def run_one(base_session, req, retries=5):
+    if not hasattr(_local, "s"):
+        _local.s = clone_session(base_session)
+    s = _local.s
+    delay, fails, waits = 3, 0, 0
+    while fails < retries and waits < 30:
+        LIMITER.acquire()
+        try:
+            r = s.post(BASE + "/api/run", json=req, timeout=(15, 120))  # прогон идёт ~1 с; зависший запрос — повтор
+        except requests.RequestException as e:
+            err = "сеть: %s" % e
+        else:
+            if r.status_code == 401:
+                raise Stop("Сессия истекла — войдите заново (пункт 1 в run.bat)")
+            if r.status_code == 200:
+                out = r.json()
+                if out.get("locked") and not ALLOW_LOCKED:
+                    raise Stop("Сервер отдаёт итоги закрытыми (locked) — нужен вход с активным ботом")
+                return out, None
+            try:
+                err = r.json().get("error") or "HTTP %d" % r.status_code
+            except ValueError:
+                err = "HTTP %d" % r.status_code
+            if r.status_code == 429:         # лимит частоты — ждём и повторяем, это не ошибка
+                ra = r.headers.get("Retry-After", "")
+                LIMITER.penalize(int(ra) + 2 if ra.isdigit() else None)
+                waits += 1
+                continue
+            if r.status_code < 500:         # ошибка в параметрах — повтор не поможет
+                return None, "HTTP %d: %s" % (r.status_code, err)
+        fails += 1
+        if STOP.wait(delay):
+            raise Stop("остановлено по запросу")
+        delay = min(delay * 2, 60)
+    return None, err
+
+
+def done_keys(path):
+    keys = set()
+    if os.path.exists(path):
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f):
+                # пустая ошибка или 4xx (неверные параметры) — посчитано окончательно;
+                # сеть, 5xx и locked — пересчитать при следующем запуске
+                if not row.get("error") or row["error"].startswith("HTTP 4"):
+                    keys.add(row["key"])
+    return keys
+
+
+def cmd_sweep(args):
+    with open(args.config, encoding="utf-8") as f:
+        cfg = json.load(f)
+    s = load_session()
+    data = get_data(s)
+    jobs = build_jobs(cfg, data)
+    out_csv = args.out or os.path.join(os.path.dirname(os.path.abspath(args.config)),
+                                       cfg.get("output", "results.csv"))
+    out_jsonl = os.path.splitext(out_csv)[0] + ".jsonl"
+    seen = done_keys(out_csv)
+    todo = [j for j in jobs if j[0] not in seen]
+    LIMITER.per_min = max(1, int(cfg.get("rate_per_min", 18)))
+    LIMITER.per_hour = max(1, int(cfg.get("rate_per_hour", 145)))
+    mins = max(len(todo) / LIMITER.per_min, len(todo) / LIMITER.per_hour * 60)
+    print("Комбинаций всего: %d, уже посчитано: %d, осталось: %d (не меньше %s: сервер даёт %d прогонов в час)"
+          % (len(jobs), len(jobs) - len(todo), len(todo),
+             "%d мин" % mins if mins < 120 else "%.1f ч" % (mins / 60), LIMITER.per_hour))
+    if args.dry_run:
+        names = sorted({row["entry"] for _, _, row in jobs})
+        print("Вариантов входа: %d" % len(names))
+        for nm in names[:40]:
+            print("  " + nm)
+        if len(names) > 40:
+            print("  … ещё %d" % (len(names) - 40))
+    if args.dry_run or not todo:
+        return
+
+    me = get_me(s, fresh=True)
+    if me.get("bots") != "active":
+        print_me(me)
+        if not args.force:
+            sys.exit("Остановлено. (--force — считать всё равно, итоги будут нулями)")
+        global ALLOW_LOCKED
+        ALLOW_LOCKED = True
+
+    workers = max(1, int(args.workers or cfg.get("workers", 2)))
+    new_file = not os.path.exists(out_csv)
+    fcsv = open(out_csv, "a", encoding="utf-8-sig" if new_file else "utf-8", newline="")
+    fjs = open(out_jsonl, "a", encoding="utf-8")
+    w = csv.DictWriter(fcsv, fieldnames=CSV_COLS, extrasaction="ignore")
+    if new_file:
+        w.writeheader()
+
+    started, n, errors = time.time(), 0, 0
+    pending = {}
+    it = iter(todo)
+
+    def submit(pool):
+        job = None if STOP.is_set() else next(it, None)
+        if job is None:
+            return False
+        pending[pool.submit(run_one, s, job[1])] = job
+        return True
+
+    stop_file = os.environ.get("GBT_STOP_FILE")   # GUI создаёт этот файл по кнопке «Стоп»
+    if stop_file:
+        def watch_stop():
+            while not STOP.wait(0.5):
+                if os.path.exists(stop_file):
+                    STOP.set()
+        threading.Thread(target=watch_stop, daemon=True).start()
+
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        for _ in range(workers * 2):
+            if not submit(pool):
+                break
+        while pending:
+            # с таймаутом: иначе на Windows Ctrl+C не прерывает ожидание
+            finished, _ = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
+            # сначала записать готовые итоги, потом — исключения (Stop), чтобы не терять посчитанное
+            for fut in sorted(finished, key=lambda f: f.exception() is not None):
+                key, req, row = pending.pop(fut)
+                out, err = fut.result()        # Stop пробрасывается наружу
+                row = dict(row)
+                if out:
+                    bt = out.get("by_trades") or {}
+                    row.update({col: bt.get(k) for k, col in RESULT_COLS.items()})
+                    row["seconds"] = out.get("seconds")
+                    if out.get("locked"):     # нули гостя — после входа пересчитаются
+                        row["error"] = "locked"
+                    slim = {k: v for k, v in out.items()
+                            if k not in ("candles", "marks", "deals", "bot")}
+                    fjs.write(json.dumps({"key": key, "request": req, "result": slim},
+                                         ensure_ascii=False) + "\n")
+                else:
+                    row["error"] = err
+                    errors += 1
+                w.writerow(row)
+                fcsv.flush()
+                fjs.flush()
+                n += 1
+                el = time.time() - started
+                eta = el / n * (len(todo) - n)
+                tag = ("ОШИБКА " + err) if err else "net %+.2f%% dd %s%%%s" % (
+                    row.get("net_pct") or 0, row.get("max_drawdown"),
+                    " ЛИКВИДАЦИЯ" if row.get("liquidated") else "")
+                print("[%d/%d] %s %s ov%s ord%s pf%s vf%s tp%s | %s -> %s | ETA %dм"
+                      % (n, len(todo), row["symbol"], row["position"], row["price_overlap"],
+                         row["orders"], row["price_factor"], row["volume_factor"], row["profit"],
+                         entry_name(row), tag, eta // 60))
+                submit(pool)
+            if STOP.is_set():
+                raise Stop("остановлено по запросу")
+    except Stop as e:
+        print("\nОстановлено: %s. Запустите ту же команду снова — продолжит с места остановки." % e)
+    except KeyboardInterrupt:
+        print("\nПрервано. Запустите ту же команду снова — продолжит с места остановки.")
+    finally:
+        STOP.set()   # потоки, ждущие лимит, сразу выходят — иначе процесс не завершится
+        pool.shutdown(wait=False, cancel_futures=True)
+        fcsv.close()
+        fjs.close()
+    print("Готово: %d прогонов, ошибок %d. Результаты: %s" % (n, errors, out_csv))
+    if n:
+        show_top(out_csv, 15)
+
+
+# ---------- отчёт ----------
+
+def entry_name(row):
+    """Короткая подпись входа для экрана."""
+    if row["entry"] == "none":
+        return "всегда в рынке (пауза %s)" % row["chart_tf"]
+    if row.get("entry_tf"):                         # готовая связка сайта
+        lvl = row.get("swing_level")
+        return "%s%s @%s" % (row["entry"], " %s%%" % lvl if lvl not in (None, "") else "",
+                             row["entry_tf"])
+    return row["entry"]                            # своё правило: tf уже в подписи
+
+
+def show_top(path, limit, allow_liq=False, by="net_pct"):
+    rows = []
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        for r in csv.DictReader(f):
+            if r.get("error") or r.get(by) in (None, ""):
+                continue
+            if not allow_liq and r.get("liquidated") == "True":
+                continue
+            rows.append(r)
+    rows.sort(key=lambda r: float(r[by]), reverse=by != "max_drawdown")
+    print("\nТоп-%d по %s%s:" % (limit, by, "" if allow_liq else " (без ликвидаций)"))
+    print("%-12s %-7s %6s %5s %5s %5s %5s %4s %9s %8s %6s  %s"
+          % ("пара", "сторона", "перекр", "ордер", "pf", "vf", "тейк", "лев",
+             "итог %", "просадка", "сделок", "вход"))
+    for r in rows[:limit]:
+        print("%-12s %-7s %6s %5s %5s %5s %5s %4s %9.2f %8s %6s  %s"
+              % (r["symbol"], r["position"], r["price_overlap"], r["orders"], r["price_factor"],
+                 r["volume_factor"], r["profit"], r["leverage"], float(r["net_pct"]),
+                 r["max_drawdown"], r["entries"], entry_name(r)))
+
+
+def cmd_top(args):
+    if not os.path.exists(args.file):
+        sys.exit("Файла %s ещё нет — сначала запустите прогон." % args.file)
+    show_top(args.file, args.n, args.with_liq, args.by)
+
+
+# ---------- меню (run.bat) ----------
+
+MENU = """
+==============================================
+   gridbacktest.com — массовые бэктесты
+==============================================
+  1. Войти через Telegram
+  2. Проверить вход
+  3. Пары, связки входа, лимиты
+  4. Посчитать число прогонов (dry-run)
+  5. Пробный прогон (sweep_test.json)
+  6. Прогон: связки сайта × параметры сетки (sweep.json)
+  7. Прогон: перебор индикаторов (sweep_indicators.json)
+  8. Лучшие результаты
+  9. Открыть файл результатов
+ 10. Редактировать конфиг
+  0. Выход
+"""
+
+
+def ask(prompt, default=""):
+    v = input("%s [%s]: " % (prompt, default) if default else prompt + ": ").strip()
+    return v or default
+
+
+def ask_config(default="sweep.json"):
+    cfg = ask("Конфиг", default)
+    path = os.path.join(HERE, cfg)
+    if not os.path.exists(path):
+        print("Файл %s не найден, беру %s" % (cfg, default))
+        path = os.path.join(HERE, default)
+    return path
+
+
+def ask_results():
+    found = sorted(f for f in os.listdir(HERE) if f.endswith(".csv"))
+    if found:
+        print("  есть: " + ", ".join(found))
+    return os.path.join(HERE, ask("Файл", found[0] if len(found) == 1 else "results.csv"))
+
+
+def sweep_args(config, **kw):
+    return argparse.Namespace(**dict(dict(config=config, out=None, workers=None,
+                                          dry_run=False, force=False), **kw))
+
+
+def menu_action(ch):
+    if ch == "1":
+        cmd_login(None)
+    elif ch == "2":
+        cmd_me(None)
+    elif ch == "3":
+        cmd_info(None)
+    elif ch == "4":
+        cmd_sweep(sweep_args(ask_config(), dry_run=True))
+    elif ch == "5":
+        cmd_sweep(sweep_args(os.path.join(HERE, "sweep_test.json")))
+    elif ch in ("6", "7"):
+        cmd_sweep(sweep_args(ask_config("sweep.json" if ch == "6" else "sweep_indicators.json")))
+    elif ch == "8":
+        f = ask_results()
+        n = ask("Сколько строк", "30")
+        print("  1 — по доходности, 2 — по просадке, 3 — по доходности вместе с ликвидациями")
+        how = ask("Сортировка", "1")
+        cmd_top(argparse.Namespace(file=f, n=int(n) if n.isdigit() else 30,
+                                   by="max_drawdown" if how == "2" else "net_pct",
+                                   with_liq=how == "3"))
+    elif ch == "9":
+        f = ask_results()
+        if os.path.exists(f):
+            os.startfile(f)
+        else:
+            print("Файла %s ещё нет." % f)
+    elif ch == "10":
+        os.startfile(ask_config())
+        return False
+    else:
+        return False
+    return True
+
+
+def cmd_menu(_args):
+    while True:
+        os.system("cls" if os.name == "nt" else "clear")
+        print(MENU)
+        try:
+            ch = input("Выбор: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if ch == "0":
+            return
+        try:
+            shown = menu_action(ch)
+        except SystemExit as e:          # sys.exit с текстом ошибки — показать и вернуться в меню
+            if e.code not in (None, 0):
+                print(e.code)
+            shown = True
+        except KeyboardInterrupt:
+            print("\nПрервано.")
+            shown = True
+        except Exception as e:
+            print("Ошибка: %s" % e)
+            shown = True
+        if shown:
+            try:
+                input("\nEnter — в меню…")
+            except (EOFError, KeyboardInterrupt):
+                return
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Массовые бэктесты gridbacktest.com")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("menu", help="интерактивное меню").set_defaults(fn=cmd_menu)
+    sub.add_parser("login", help="вход через Telegram").set_defaults(fn=cmd_login)
+    sub.add_parser("me", help="проверить сессию").set_defaults(fn=cmd_me)
+    sub.add_parser("info", help="пары, связки, лимиты").set_defaults(fn=cmd_info)
+    p = sub.add_parser("sweep", help="прогнать комбинации из конфига")
+    p.add_argument("config")
+    p.add_argument("--out", help="CSV с результатами (по умолчанию из конфига / results.csv)")
+    p.add_argument("--workers", type=int, help="параллельных запросов")
+    p.add_argument("--dry-run", action="store_true", help="только посчитать комбинации")
+    p.add_argument("--force", action="store_true", help="считать, даже если итоги закрыты")
+    p.set_defaults(fn=cmd_sweep)
+    p = sub.add_parser("top", help="лучшие результаты из CSV")
+    p.add_argument("file", nargs="?", default=os.path.join(HERE, "results.csv"))
+    p.add_argument("-n", type=int, default=30)
+    p.add_argument("--by", default="net_pct", choices=["net_pct", "net", "max_drawdown"])
+    p.add_argument("--with-liq", action="store_true", help="включать ликвидированные")
+    p.set_defaults(fn=cmd_top)
+    args = ap.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

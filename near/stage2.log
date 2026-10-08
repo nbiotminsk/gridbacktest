@@ -1,0 +1,95 @@
+Комбинаций всего: 72, уже посчитано: 0, осталось: 72 (не меньше 29 мин: сервер даёт 145 прогонов в час)
+[1/72] NEARUSDT long ov60 ord10 pf1.4 vf1.05 tp1 | rsi @60 -> net +116.00% dd 33.5% | ETA 1м
+[2/72] NEARUSDT long ov60 ord10 pf1.4 vf1.05 tp0.7 | rsi @60 -> net +75.36% dd 29.8% | ETA 0м
+[3/72] NEARUSDT long ov60 ord10 pf1.4 vf1.05 tp2 | rsi @60 -> net -100.00% dd 98.1% ЛИКВИДАЦИЯ | ETA 0м
+[4/72] NEARUSDT long ov60 ord10 pf1.4 vf1.05 tp1.5 | rsi @60 -> net -100.00% dd 98.4% ЛИКВИДАЦИЯ | ETA 0м
+[5/72] NEARUSDT long ov60 ord10 pf1.4 vf1.2 tp1 | rsi @60 -> net +61.36% dd 18.1% | ETA 0м
+[6/72] NEARUSDT long ov60 ord10 pf1.4 vf1.2 tp0.7 | rsi @60 -> net +39.57% dd 19.2% | ETA 0м
+[7/72] NEARUSDT long ov60 ord10 pf1.4 vf1.2 tp1.5 | rsi @60 -> net +95.84% dd 60.7% | ETA 0м
+[8/72] NEARUSDT long ov60 ord10 pf1.4 vf1.2 tp2 | rsi @60 -> net -100.00% dd 98.2% ЛИКВИДАЦИЯ | ETA 0м
+[9/72] NEARUSDT long ov60 ord10 pf1.4 vf1.4 tp0.7 | rsi @60 -> net +16.55% dd 10.0% | ETA 0м
+[10/72] NEARUSDT long ov60 ord10 pf1.4 vf1.4 tp1 | rsi @60 -> net +26.46% dd 9.7% | ETA 0м
+[11/72] NEARUSDT long ov60 ord10 pf1.4 vf1.4 tp1.5 | rsi @60 -> net +41.51% dd 22.6% | ETA 0м
+[12/72] NEARUSDT long ov60 ord10 pf1.4 vf1.4 tp2 | rsi @60 -> net +62.11% dd 87.2% | ETA 0м
+  …сервер просит подождать 12 мин (лимит), ждём до 00:04
+  …часовой лимит сервера (145 прогонов/ч): ждём 12 мин, до 00:04
+[13/72] NEARUSDT long ov60 ord20 pf1.4 vf1.05 tp0.7 | rsi @60 -> net -100.00% dd 98.3% ЛИКВИДАЦИЯ | ETA 0м
+  …сервер просит подождать 2 мин (лимит), ждём до 00:05
+[14/72] NEARUSDT long ov60 ord20 pf1.4 vf1.05 tp1 | rsi @60 -> net -100.00% dd 98.5% ЛИКВИДАЦИЯ | ETA 46м
+[15/72] NEARUSDT long ov60 ord20 pf1.4 vf1.05 tp2 | rsi @60 -> net -100.00% dd 98.6% ЛИКВИДАЦИЯ | ETA 46м
+[16/72] NEARUSDT long ov60 ord20 pf1.4 vf1.05 tp1.5 | rsi @60 -> net -100.00% dd 98.5% ЛИКВИДАЦИЯ | ETA 42м
+[17/72] NEARUSDT long ov60 ord20 pf1.4 vf1.2 tp1 | rsi @60 -> net +76.68% dd 28.8% | ETA 39м
+[18/72] NEARUSDT long ov60 ord20 pf1.4 vf1.2 tp0.7 | rsi @60 -> net +46.02% dd 32.5% | ETA 36м
+[19/72] NEARUSDT long ov60 ord20 pf1.4 vf1.2 tp1.5 | rsi @60 -> net +121.65% dd 67.9% | ETA 34м
+[20/72] NEARUSDT long ov60 ord20 pf1.4 vf1.2 tp2 | rsi @60 -> net -100.00% dd 100.0% ЛИКВИДАЦИЯ | ETA 31м
+[21/72] NEARUSDT long ov60 ord20 pf1.4 vf1.4 tp1 | rsi @60 -> net +19.26% dd 15.0% | ETA 29м
+[22/72] NEARUSDT long ov60 ord20 pf1.4 vf1.4 tp0.7 | rsi @60 -> net +10.15% dd 9.2% | ETA 27м
+[23/72] NEARUSDT long ov60 ord20 pf1.4 vf1.4 tp1.5 | rsi @60 -> net +34.17% dd 14.0% | ETA 26м
+[24/72] NEARUSDT long ov60 ord20 pf1.4 vf1.4 tp2 | rsi @60 -> net +52.82% dd 12.9% | ETA 24м
+[25/72] NEARUSDT long ov75 ord10 pf1.4 vf1.05 tp0.7 | rsi @60 -> net +71.78% dd 33.5% | ETA 23м
+[26/72] NEARUSDT long ov75 ord10 pf1.4 vf1.05 tp1 | rsi @60 -> net +110.67% dd 29.1% | ETA 21м
+[27/72] NEARUSDT long ov75 ord10 pf1.4 vf1.05 tp1.5 | rsi @60 -> net -100.00% dd 98.2% ЛИКВИДАЦИЯ | ETA 20м
+[28/72] NEARUSDT long ov75 ord10 pf1.4 vf1.05 tp2 | rsi @60 -> net -100.00% dd 98.5% ЛИКВИДАЦИЯ | ETA 19м
+[29/72] NEARUSDT long ov75 ord10 pf1.4 vf1.2 tp0.7 | rsi @60 -> net +37.69% dd 23.5% | ETA 18м
+[30/72] NEARUSDT long ov75 ord10 pf1.4 vf1.2 tp1 | rsi @60 -> net +58.76% dd 21.5% | ETA 17м
+[31/72] NEARUSDT long ov75 ord10 pf1.4 vf1.2 tp2 | rsi @60 -> net -100.00% dd 98.6% ЛИКВИДАЦИЯ | ETA 16м
+[32/72] NEARUSDT long ov75 ord10 pf1.4 vf1.2 tp1.5 | rsi @60 -> net -100.00% dd 98.4% ЛИКВИДАЦИЯ | ETA 15м
+[33/72] NEARUSDT long ov75 ord10 pf1.4 vf1.4 tp0.7 | rsi @60 -> net +15.09% dd 13.2% | ETA 15м
+[34/72] NEARUSDT long ov75 ord10 pf1.4 vf1.4 tp1 | rsi @60 -> net +24.93% dd 12.6% | ETA 14м
+[35/72] NEARUSDT long ov75 ord10 pf1.4 vf1.4 tp1.5 | rsi @60 -> net +39.16% dd 18.0% | ETA 14м
+[36/72] NEARUSDT long ov75 ord10 pf1.4 vf1.4 tp2 | rsi @60 -> net +58.65% dd 84.3% | ETA 13м
+[37/72] NEARUSDT long ov75 ord20 pf1.4 vf1.05 tp0.7 | rsi @60 -> net -100.00% dd 97.7% ЛИКВИДАЦИЯ | ETA 12м
+[38/72] NEARUSDT long ov75 ord20 pf1.4 vf1.05 tp1 | rsi @60 -> net -100.00% dd 98.0% ЛИКВИДАЦИЯ | ETA 11м
+[39/72] NEARUSDT long ov75 ord20 pf1.4 vf1.05 tp1.5 | rsi @60 -> net -100.00% dd 98.8% ЛИКВИДАЦИЯ | ETA 11м
+[40/72] NEARUSDT long ov75 ord20 pf1.4 vf1.05 tp2 | rsi @60 -> net -100.00% dd 98.5% ЛИКВИДАЦИЯ | ETA 10м
+[41/72] NEARUSDT long ov75 ord20 pf1.4 vf1.2 tp0.7 | rsi @60 -> net +39.18% dd 30.0% | ETA 10м
+[42/72] NEARUSDT long ov75 ord20 pf1.4 vf1.2 tp1 | rsi @60 -> net +65.31% dd 26.9% | ETA 9м
+[43/72] NEARUSDT long ov75 ord20 pf1.4 vf1.2 tp1.5 | rsi @60 -> net -100.00% dd 98.6% ЛИКВИДАЦИЯ | ETA 8м
+[44/72] NEARUSDT long ov75 ord20 pf1.4 vf1.2 tp2 | rsi @60 -> net -100.00% dd 99.0% ЛИКВИДАЦИЯ | ETA 8м
+[45/72] NEARUSDT long ov75 ord20 pf1.4 vf1.4 tp0.7 | rsi @60 -> net +7.88% dd 7.5% | ETA 8м
+[46/72] NEARUSDT long ov75 ord20 pf1.4 vf1.4 tp1 | rsi @60 -> net +14.77% dd 7.4% | ETA 7м
+[47/72] NEARUSDT long ov75 ord20 pf1.4 vf1.4 tp1.5 | rsi @60 -> net +26.74% dd 12.1% | ETA 7м
+[48/72] NEARUSDT long ov75 ord20 pf1.4 vf1.4 tp2 | rsi @60 -> net +41.22% dd 16.6% | ETA 6м
+[49/72] NEARUSDT long ov90 ord10 pf1.4 vf1.05 tp0.7 | rsi @60 -> net +66.61% dd 31.6% | ETA 6м
+[50/72] NEARUSDT long ov90 ord10 pf1.4 vf1.05 tp1 | rsi @60 -> net +101.52% dd 27.8% | ETA 5м
+[51/72] NEARUSDT long ov90 ord10 pf1.4 vf1.05 tp1.5 | rsi @60 -> net +147.44% dd 31.7% | ETA 5м
+[52/72] NEARUSDT long ov90 ord10 pf1.4 vf1.05 tp2 | rsi @60 -> net -100.00% dd 99.7% ЛИКВИДАЦИЯ | ETA 5м
+[53/72] NEARUSDT long ov90 ord10 pf1.4 vf1.2 tp0.7 | rsi @60 -> net +33.41% dd 14.3% | ETA 5м
+[54/72] NEARUSDT long ov90 ord10 pf1.4 vf1.2 tp1 | rsi @60 -> net +52.48% dd 19.9% | ETA 4м
+[55/72] NEARUSDT long ov90 ord10 pf1.4 vf1.2 tp1.5 | rsi @60 -> net +78.02% dd 25.1% | ETA 4м
+[56/72] NEARUSDT long ov90 ord10 pf1.4 vf1.2 tp2 | rsi @60 -> net +104.92% dd 93.9% | ETA 4м
+[57/72] NEARUSDT long ov90 ord10 pf1.4 vf1.4 tp1 | rsi @60 -> net +21.67% dd 11.2% | ETA 3м
+[58/72] NEARUSDT long ov90 ord10 pf1.4 vf1.4 tp0.7 | rsi @60 -> net +13.41% dd 6.8% | ETA 3м
+[59/72] NEARUSDT long ov90 ord10 pf1.4 vf1.4 tp1.5 | rsi @60 -> net +33.39% dd 15.8% | ETA 3м
+[60/72] NEARUSDT long ov90 ord10 pf1.4 vf1.4 tp2 | rsi @60 -> net +48.38% dd 73.2% | ETA 2м
+[61/72] NEARUSDT long ov90 ord20 pf1.4 vf1.05 tp0.7 | rsi @60 -> net -100.00% dd 98.1% ЛИКВИДАЦИЯ | ETA 2м
+[62/72] NEARUSDT long ov90 ord20 pf1.4 vf1.05 tp1 | rsi @60 -> net -100.00% dd 98.2% ЛИКВИДАЦИЯ | ETA 2м
+[63/72] NEARUSDT long ov90 ord20 pf1.4 vf1.05 tp2 | rsi @60 -> net -100.00% dd 99.2% ЛИКВИДАЦИЯ | ETA 2м
+[64/72] NEARUSDT long ov90 ord20 pf1.4 vf1.05 tp1.5 | rsi @60 -> net -100.00% dd 98.6% ЛИКВИДАЦИЯ | ETA 1м
+[65/72] NEARUSDT long ov90 ord20 pf1.4 vf1.2 tp0.7 | rsi @60 -> net +34.60% dd 27.3% | ETA 1м
+[66/72] NEARUSDT long ov90 ord20 pf1.4 vf1.2 tp1 | rsi @60 -> net +58.55% dd 24.8% | ETA 1м
+[67/72] NEARUSDT long ov90 ord20 pf1.4 vf1.2 tp1.5 | rsi @60 -> net +95.96% dd 21.3% | ETA 1м
+[68/72] NEARUSDT long ov90 ord20 pf1.4 vf1.2 tp2 | rsi @60 -> net +130.15% dd 53.1% | ETA 0м
+[69/72] NEARUSDT long ov90 ord20 pf1.4 vf1.4 tp0.7 | rsi @60 -> net +5.91% dd 6.2% | ETA 0м
+[70/72] NEARUSDT long ov90 ord20 pf1.4 vf1.4 tp1 | rsi @60 -> net +12.52% dd 10.6% | ETA 0м
+[71/72] NEARUSDT long ov90 ord20 pf1.4 vf1.4 tp1.5 | rsi @60 -> net +23.01% dd 10.1% | ETA 0м
+[72/72] NEARUSDT long ov90 ord20 pf1.4 vf1.4 tp2 | rsi @60 -> net +37.21% dd 9.5% | ETA 0м
+Готово: 72 прогонов, ошибок 0. Результаты: C:\Users\Admin\Desktop\backtestPif\near\stage2.csv
+
+Топ-15 по net_pct (без ликвидаций):
+пара         сторона перекр ордер    pf    vf  тейк  лев    итог % просадка сделок  вход
+NEARUSDT     long        90    10   1.4  1.05   1.5   10    147.44     31.7     76  rsi @60
+NEARUSDT     long        90    20   1.4   1.2     2   10    130.15     53.1     68  rsi @60
+NEARUSDT     long        60    20   1.4   1.2   1.5   10    121.65     67.9     81  rsi @60
+NEARUSDT     long        60    10   1.4  1.05     1   10    116.00     33.5     93  rsi @60
+NEARUSDT     long        75    10   1.4  1.05     1   10    110.67     29.1     93  rsi @60
+NEARUSDT     long        90    10   1.4   1.2     2   10    104.92     93.9     61  rsi @60
+NEARUSDT     long        90    10   1.4  1.05     1   10    101.52     27.8     93  rsi @60
+NEARUSDT     long        90    20   1.4   1.2   1.5   10     95.96     21.3     83  rsi @60
+NEARUSDT     long        60    10   1.4   1.2   1.5   10     95.84     60.7     74  rsi @60
+NEARUSDT     long        90    10   1.4   1.2   1.5   10     78.02     25.1     77  rsi @60
+NEARUSDT     long        60    20   1.4   1.2     1   10     76.68     28.8     98  rsi @60
+NEARUSDT     long        60    10   1.4  1.05   0.7   10     75.36     29.8    102  rsi @60
+NEARUSDT     long        75    10   1.4  1.05   0.7   10     71.78     33.5     97  rsi @60
+NEARUSDT     long        90    10   1.4  1.05   0.7   10     66.61     31.6     97  rsi @60
+NEARUSDT     long        75    20   1.4   1.2     1   10     65.31     26.9     98  rsi @60

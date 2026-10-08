@@ -1,0 +1,41 @@
+{
+  "_comment": "Перебор индикаторов: у каждого любые поля могут быть списком — переберутся все сочетания. value/op задаются для лонга, для шорта зеркалятся сами (RSI < 30 -> > 70); свои значения для шорта — short_value / short_op.",
+
+  "symbols": ["BTCUSDT"],
+  "positions": ["long", "short"],
+  "periods": [{"years": 2}],
+
+  "entries": ["none"],
+
+  "indicators": [
+    {"ind": "rsi",        "period": [7, 14, 21], "value": [20, 25, 30], "tf": [15, 60]},
+    {"ind": "stoch_rsi",  "period": [14],        "value": [10, 20],     "tf": [15, 60]},
+    {"ind": "cci",        "period": [14, 20],    "value": [-100, -150], "tf": 60},
+    {"ind": "bb",         "period": [20, 30],    "mult": [2, 2.5],      "tf": 60},
+    {"ind": "supertrend", "period": [7, 10],     "mult": [2, 3],        "tf": [60, 240]},
+    {"ind": "drawdown",   "hours": [4, 12],      "value": [1, 2, 3],    "tf": 60},
+    {"ind": "big",        "line": ["250k", "1m"], "value": [20, 40],    "tf": 60},
+
+    {"all": [
+      {"ind": "rsi",       "period": 14, "value": [25, 30], "tf": 60},
+      {"ind": "vol_spike", "period": 20, "value": [2, 3],   "tf": 60}
+    ]},
+
+    {"any": [
+      {"ind": "rsi",      "period": 14, "value": 30, "tf": 60},
+      {"ind": "drawdown", "hours": 4,   "value": [2, 3], "tf": 60}
+    ]}
+  ],
+
+  "defaults": {"deposit": 1000, "leverage": 10, "reinvest": 0},
+  "sets": [
+    {"price_overlap": 40, "orders": 20, "price_factor": 1.4, "volume_factor": 1.05, "profit": 0.5},
+    {"price_overlap": 25, "orders": 15, "price_factor": 1.6, "volume_factor": 1.2,  "profit": 1},
+    {"price_overlap": 15, "orders": 10, "price_factor": 1.8, "volume_factor": 1.4,  "profit": 1.5}
+  ],
+  "fees": {"fee_maker": 0.0002, "fee_taker": 0.0005},
+
+  "workers": 2,
+  "rate_per_min": 18,
+  "output": "results_indicators.csv"
+}

@@ -1,0 +1,24 @@
+{
+  "symbols": ["BTCUSDT", "ETHUSDT"],
+  "positions": ["long", "short"],
+  "periods": [{"years": 4}],
+
+  "entries": "all",
+  "entry_tfs": [60],
+  "swing_levels": [1],
+  "chart_tfs": [60],
+
+  "defaults": {"deposit": 1000, "leverage": 10, "reinvest": 0},
+  "grid": {
+    "orders":        [10, 20],
+    "price_overlap": [15, 25, 40],
+    "price_factor":  [1.4, 1.6, 1.8],
+    "volume_factor": [1.05, 1.2, 1.4],
+    "profit":        [0.5, 1, 1.5]
+  },
+  "fees": {"fee_maker": 0.0002, "fee_taker": 0.0005},
+
+  "workers": 2,
+  "rate_per_min": 18,
+  "output": "results.csv"
+}
