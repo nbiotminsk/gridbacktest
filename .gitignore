@@ -6,6 +6,11 @@ rate.json
 rate.json.tmp
 .gbt_stop
 sweep_gui.json
+pairs_cache.json
+
+# результаты прогонов — у каждого свои
+results*.csv
+results*.jsonl
 
 __pycache__/
 *.pyc

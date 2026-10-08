@@ -1,15 +1,19 @@
 """Разбор результатов: фронт Парето «итог % ↔ просадка %» и лучшие по отношению итог/просадка.
 
-  python near/analyze.py near/stage1.csv [near/stage2.csv ...]
+  python analyze.py results.csv [results_indicators.csv ...]
 """
 import csv
+import os
 import sys
 from collections import defaultdict
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-sys.path.insert(0, __file__.rsplit("near", 1)[0])
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gbt import entry_name  # noqa: E402
 
+if len(sys.argv) < 2:
+    print(__doc__)
+    sys.exit(1)
 rows = []
 for path in sys.argv[1:]:
     with open(path, encoding="utf-8-sig", newline="") as f:

@@ -1,8 +1,0 @@
-{
-  "symbols": ["NEARUSDT"], "positions": ["long", "short"], "periods": [{"years": 1}],
-  "entries": "all", "entry_tfs": [60], "swing_levels": [2],
-  "defaults": {"deposit": 1000, "leverage": 10, "reinvest": 0,
-               "orders": 15, "price_factor": 1.4, "volume_factor": 1.2, "profit": 1},
-  "grid": {"price_overlap": [30, 50, 70, 90]},
-  "workers": 2, "output": "stage1.csv"
-}
