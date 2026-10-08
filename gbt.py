@@ -24,7 +24,6 @@ import threading
 import time
 import webbrowser
 from calendar import monthrange
-from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 import requests
@@ -668,33 +667,86 @@ STOP = threading.Event()   # остановка прогона: Ctrl+C или к
 RATE_FILE = os.path.join(HERE, "rate.json")
 
 
+class FileLock:
+    """Блокировка между процессами (окно, командная строка, второе окно) — файл RATE_FILE.lock."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        self.f = open(self.path, "a+b")
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    self.f.seek(0)
+                    msvcrt.locking(self.f.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self.f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                time.sleep(0.05)
+
+    def __exit__(self, *exc):
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self.f.seek(0)
+                msvcrt.locking(self.f.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.f.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.f.close()
+
+
+def read_rate():
+    """(время прогонов за последний час, пауза до) из RATE_FILE; старый формат — просто список."""
+    try:
+        with open(RATE_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return [], 0.0
+    if isinstance(d, list):
+        return sorted(d), 0.0
+    return sorted(d.get("stamps", [])), float(d.get("block_until", 0))
+
+
+def write_rate(stamps, block_until):
+    """Через временный файл — обрыв посреди записи не портит rate.json."""
+    tmp = RATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"stamps": stamps, "block_until": block_until}, f)
+    for _ in range(20):
+        try:
+            os.replace(tmp, RATE_FILE)
+            return
+        except PermissionError:       # Windows: файл на миг открыт другим процессом
+            time.sleep(0.05)
+
+
 class RateLimiter:
-    """Лимиты сервера на прогоны — общий счётчик на все потоки.
+    """Лимиты сервера на прогоны — общий счёт на все потоки и все процессы.
 
     Замер 07.10.2026: не больше 20 прогонов в минуту (21-й — 429 «слишком часто,
     подождите минуту») и не больше 150 за последний час (429 «лимит 150»,
-    с Retry-After). Время прогонов хранится в rate.json, чтобы перезапуск
-    скрипта не обнулял часовой счёт — сервер его не обнуляет.
+    с Retry-After). Лимит — на аккаунт, поэтому счёт общий: перед каждым прогоном
+    процесс под блокировкой файла читает rate.json, проверяет лимит и дописывает себя.
+    Два окна, окно и командная строка — все видят один счёт; перезапуск его не обнуляет.
     """
+
+    MINUTE, HOUR = 60, 3600
 
     def __init__(self, per_min=18, per_hour=145):
         self.per_min, self.per_hour = per_min, per_hour
-        self.stamps = deque()
-        self.block_until = 0.0
         self.said_until = 0.0
         self.lock = threading.Lock()
-        try:
-            with open(RATE_FILE, encoding="utf-8") as f:
-                self.stamps.extend(sorted(json.load(f)))
-        except (OSError, ValueError):
-            pass
 
-    def _wait(self, now):
-        while self.stamps and now - self.stamps[0] >= 3600:
-            self.stamps.popleft()
-        pause = self.block_until - now
-        for span, limit in ((60, self.per_min), (3600, self.per_hour)):
-            inside = [t for t in self.stamps if now - t < span]
+    def _pause(self, stamps, block_until, now):
+        pause = block_until - now
+        for span, limit in ((self.MINUTE, self.per_min), (self.HOUR, self.per_hour)):
+            inside = [t for t in stamps if now - t < span]
             if len(inside) >= limit:
                 pause = max(pause, inside[len(inside) - limit] + span - now + 0.5)
         return pause
@@ -703,34 +755,32 @@ class RateLimiter:
         while True:
             if STOP.is_set():
                 raise Stop("остановлено по запросу")
-            with self.lock:
+            with self.lock, FileLock(RATE_FILE + ".lock"):
                 now = time.time()
-                pause = self._wait(now)
+                stamps, block_until = read_rate()
+                stamps = [t for t in stamps if now - t < self.HOUR]
+                pause = self._pause(stamps, block_until, now)
                 if pause <= 0:
-                    self.stamps.append(now)
-                    try:   # через временный файл — обрыв посреди записи не портит rate.json
-                        tmp = RATE_FILE + ".tmp"
-                        with open(tmp, "w", encoding="utf-8") as f:
-                            json.dump(list(self.stamps), f)
-                        os.replace(tmp, RATE_FILE)
-                    except OSError:
-                        pass
+                    stamps.append(now)
+                    write_rate(stamps, block_until)
                     return
-                if pause > 90 and now + pause > self.said_until + 60:
-                    self.said_until = now + pause
-                    print("  …часовой лимит сервера (%d прогонов/ч): ждём %d мин, до %s"
-                          % (self.per_hour, pause // 60 + 1,
-                             time.strftime("%H:%M", time.localtime(now + pause))))
+            if pause > 90 and now + pause > self.said_until + 60:
+                self.said_until = now + pause
+                print("  …часовой лимит сервера (%d прогонов/ч): ждём %d мин, до %s"
+                      % (self.per_hour, pause // 60 + 1,
+                         time.strftime("%H:%M", time.localtime(now + pause))))
             STOP.wait(min(pause, 5))
 
     def penalize(self, seconds=None):
-        with self.lock:
-            seconds = max(61, seconds or 0)
-            if self.block_until <= time.time():
+        """Сервер ответил 429 — пауза для всех процессов."""
+        seconds = max(61, seconds or 0)
+        with self.lock, FileLock(RATE_FILE + ".lock"):
+            stamps, block_until = read_rate()
+            now = time.time()
+            if block_until <= now:
                 print("  …сервер просит подождать %d мин (лимит), ждём до %s"
-                      % ((seconds + 59) // 60,
-                         time.strftime("%H:%M", time.localtime(time.time() + seconds))))
-            self.block_until = max(self.block_until, time.time() + seconds)
+                      % ((seconds + 59) // 60, time.strftime("%H:%M", time.localtime(now + seconds))))
+            write_rate([t for t in stamps if now - t < self.HOUR], max(block_until, now + seconds))
 
 
 LIMITER = RateLimiter()   # у сервера 20/мин и 150/ч — держим с запасом
@@ -1014,11 +1064,7 @@ RUN_SECONDS = 2.0   # сколько в среднем идёт один про�
 
 def rate_usage():
     """(прогонов за последнюю минуту, за последний час) — по rate.json, общий на все запуски."""
-    try:
-        with open(RATE_FILE, encoding="utf-8") as f:
-            stamps = json.load(f)
-    except (OSError, ValueError):
-        return 0, 0
+    stamps, _ = read_rate()
     now = time.time()
     return sum(now - t < 60 for t in stamps), sum(now - t < 3600 for t in stamps)
 
