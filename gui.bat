@@ -1,6 +1,7 @@
 @echo off
 rem gridbacktest GUI launcher: gui.bat
 rem The file is ASCII-only on purpose: cmd misreads UTF-8 text in .bat files.
+rem The window is started with pythonw (no console), and this console closes right away.
 setlocal
 cd /d "%~dp0"
 chcp 65001 >nul
@@ -20,5 +21,11 @@ if errorlevel 1 (
   python -m pip install --user requests
 )
 
-python gui.py
-if errorlevel 1 pause
+where pythonw >nul 2>nul
+if errorlevel 1 (
+  rem no pythonw - start with the console as before
+  python gui.py
+  if errorlevel 1 pause
+  exit /b
+)
+start "" pythonw gui.py

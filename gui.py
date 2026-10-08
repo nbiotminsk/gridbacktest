@@ -18,6 +18,7 @@ import re
 import subprocess
 import sys
 import threading
+import traceback
 import tkinter as tk
 from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
@@ -85,6 +86,8 @@ def num(text, integer):
         v = float(t)
     except ValueError:
         raise ValueError("«%s» — не число" % t)
+    if v != v or v in (float("inf"), float("-inf")):      # float() пропускает nan и inf
+        raise ValueError("«%s» — не число" % t)
     if integer:
         if abs(v - round(v)) > 1e-9:
             raise ValueError("нужно целое: %s" % t)
@@ -136,7 +139,7 @@ def parse_json_list(text, what):
     except ValueError as e:
         raise ValueError("%s — неверный JSON: %s" % (what, e))
     if not isinstance(val, list) or not all(isinstance(x, dict) for x in val):
-        raise ValueError("%s должен быть списком объектов [{...}, ...]" % what)
+        raise ValueError("%s: нужен список объектов [{...}, ...]" % what)
     return val
 
 
@@ -1048,6 +1051,13 @@ class App:
     def set_status(self, text):
         self.status.config(text=text)
 
+    def on_error(self, exc, val, tb):
+        """Ошибка в обработчике кнопки — в журнал: консоли у окна нет (pythonw)."""
+        self.say("ОШИБКА в окне: %s: %s" % (exc.__name__, val), "err")
+        for line in traceback.format_exception(exc, val, tb)[-4:]:
+            self.say("  " + line.rstrip(), "err")
+        self.set_status("Ошибка в окне — подробности в журнале")
+
     def _apply_data(self, data, say=True):
         self.data = data
         if self.sel_tpls is None:
@@ -1285,6 +1295,9 @@ class App:
                 "rate_per_hour": self._pos_int(self.rate_hour, "Прогонов в час"),
                 "output": self.output.get().strip() or "results.csv",
             }
+            folder = os.path.dirname(os.path.join(HERE, cfg["output"]))
+            if not os.path.isdir(folder):
+                raise ValueError("Файл результатов: папки «%s» нет" % folder)
             stops = self._row_values("stop_loss")
             if stops != [0]:
                 cfg["stop_loss"] = stops
@@ -1354,6 +1367,9 @@ class App:
             try:
                 total = self._gbt(gbt.count_jobs, cfg)
                 entries = self._gbt(lambda c, d: gbt.entry_variants(c, d, cfg["positions"][0]), cfg)
+                if total == 0 and entries:
+                    err = ("0 прогонов: ни у одной выбранной пары нет истории за этот период — "
+                           "выберите другие даты или «лет»")
             except ValueError as e:
                 err = str(e)
         if err:
@@ -1641,12 +1657,15 @@ class App:
         except OSError:
             pass
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", GBT_STOP_FILE=STOP_FILE)
-        cmd = [sys.executable, os.path.join(HERE, "gbt.py")] + list(args)
+        cmd = [console_python(), os.path.join(HERE, "gbt.py")] + list(args)
         self.say("$ " + " ".join(["python", "gbt.py"] + list(args)), "cmd")
         try:
+            # без окна консоли: окно программы запущено через pythonw, и дочерний процесс
+            # иначе открыл бы своё чёрное окно
             self.proc = subprocess.Popen(
                 cmd, cwd=HERE, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                encoding="utf-8", errors="replace", bufsize=1)
+                encoding="utf-8", errors="replace", bufsize=1,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except OSError as e:
             self.proc = None
             self.say("Не запустилось: %s" % e, "err")
@@ -1726,12 +1745,28 @@ class App:
                 pass
 
 
+def console_python():
+    """python.exe рядом с pythonw.exe: у gbt.py должен быть настоящий вывод для журнала."""
+    exe = sys.executable
+    if os.path.basename(exe).lower() == "pythonw.exe":
+        console = os.path.join(os.path.dirname(exe), "python.exe")
+        if os.path.exists(console):
+            return console
+    return exe
+
+
 def main():
+    # gui.bat запускает окно через pythonw — консоли нет, поэтому ошибки показываем в окне
     try:
         root = tk.Tk()
     except tk.TclError as e:
         sys.exit("Не открылось окно: %s\nПроверьте, что Python установлен с tkinter." % e)
-    App(root)
+    try:
+        app = App(root)
+    except Exception:
+        messagebox.showerror("gridbacktest", "Окно не открылось:\n\n" + traceback.format_exc())
+        raise
+    root.report_callback_exception = app.on_error
     root.mainloop()
 
 

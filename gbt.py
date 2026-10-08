@@ -905,6 +905,8 @@ def cmd_sweep(args):
     out_csv = args.out or os.path.join(os.path.dirname(os.path.abspath(args.config)),
                                        cfg.get("output", "results.csv"))
     out_jsonl = os.path.splitext(out_csv)[0] + ".jsonl"
+    if not os.path.isdir(os.path.dirname(os.path.abspath(out_csv))):
+        sys.exit("Папки для файла результатов нет: %s" % os.path.dirname(os.path.abspath(out_csv)))
     stops = stop_list(cfg)
     todo, local = plan(cfg, jobs, out_csv)
     LIMITER.per_min = max(1, int(cfg.get("rate_per_min", 18)))
