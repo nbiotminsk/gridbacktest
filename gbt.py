@@ -265,74 +265,133 @@ FLIP_OP = {"lt": "gt", "gt": "lt", "cross_up": "cross_down", "cross_down": "cros
 # параметры индикатора, которые можно перебирать списком (кроме tf/op/value)
 IND_KEYS = ["period", "mult", "line", "method", "price", "hours", "shift"]
 SHORT_IND = {"drawdown": "runup", "runup": "drawdown"}
+BB_FLIP = {"lower": "upper", "upper": "lower"}   # полоса Боллинджера в шорте — зеркальная
+LEAF_KEYS = {"ind", "tf", "op", "value", "right", "short_ind", "short_op", "short_value"} | set(IND_KEYS)
 
 
 def num_text(v):
     return ("%g" % v) if isinstance(v, float) else str(v)
 
 
-def leaf_variants(spec, side, cfg, data):
-    """Один фильтр-индикатор -> [(подпись, [[filter]])] по всем комбинациям его списков.
+def ind_text(ind, params):
+    return "%s(%s)" % (ind, ",".join(num_text(v) for v in params.values())) if params else ind
 
-    value/op задаются для лонга; для шорта берутся short_value/short_op, а если их нет —
-    зеркально по норме сайта (RSI ниже 30 -> выше 70, CCI ниже −100 -> выше +100);
-    у индикаторов, где норма одна для обеих сторон (ADX, всплеск объёма), — как есть.
-    drawdown в шорте сам становится runup (как у связки swing); иначе — short_ind.
-    """
-    short = side == "short"
-    ind = spec["ind"]
-    if short:   # как у связки swing: в лонг — откат от максимума, в шорт — отскок от минимума
-        ind = spec.get("short_ind", SHORT_IND.get(ind, ind))
+
+def ind_meta(ind, data):
     meta = next((c for c in data["catalog"] if c["id"] == ind), None)
     if not meta:
         sys.exit("Неизвестный индикатор: %s (см. python gbt.py info)" % ind)
+    return meta
+
+
+def plain_leaf(spec):
+    """Короткая запись {"ind": "bb" | "ma", ...} — цена против полосы / средней:
+    -> {"ind": "price", "right": {"ind": "bb", ...}}. Ширина полос (line: width) — число, как есть."""
+    if spec["ind"] not in ("bb", "ma") or "right" in spec or "width" in as_list(spec.get("line", [])):
+        return spec
+    out = {k: v for k, v in spec.items() if k not in IND_KEYS}
+    out["right"] = dict({"ind": spec["ind"]}, **{k: spec[k] for k in IND_KEYS if k in spec})
+    out["ind"] = "price"
+    return out
+
+
+def check_params(ind, axes, prefix, data):
+    """Границы сайта для period / mult / hours / shift (значение по умолчанию — всегда можно)."""
+    meta, lim = ind_meta(ind, data), data["entry_limits"]
+    for k in ("period", "mult", "hours", "shift"):
+        for v in axes.get(prefix + k, []):
+            if k in lim and not lim[k][0] <= v <= lim[k][1] and v != meta.get("defaults", {}).get(k):
+                sys.exit("%s: %s %s вне границ сайта %s…%s" % (ind, k, num_text(v), lim[k][0], lim[k][1]))
+
+
+def leaf_variants(spec, side, cfg, data):
+    """Одно условие -> [(подпись, [[filter]])] по всем комбинациям его списков.
+
+    Справа — число (value) или другой индикатор (right: {"ind": ..., параметры}).
+    value/op задаются для лонга; для шорта берутся short_value/short_op, а если их нет —
+    зеркально по норме сайта (RSI ниже 30 -> выше 70, CCI ниже −100 -> выше +100);
+    у индикаторов, где норма одна для обеих сторон (ADX, всплеск объёма), — как есть.
+    Полоса Боллинджера в шорте — зеркальная (нижняя -> верхняя).
+    drawdown в шорте сам становится runup (как у связки swing); иначе — short_ind.
+    """
+    short = side == "short"
+    unknown = set(spec) - LEAF_KEYS
+    if unknown:
+        sys.exit("Условие %s: неизвестные поля %s" % (spec["ind"], ", ".join(sorted(unknown))))
+    spec = plain_leaf(spec)
+    ind = spec["ind"]
+    if short:   # как у связки swing: в лонг — откат от максимума, в шорт — отскок от минимума
+        ind = spec.get("short_ind", SHORT_IND.get(ind, ind))
+    meta = ind_meta(ind, data)
     norm = data["norms"].get(ind, {})
-    vs_price = ind in ("bb", "ma")         # полосы/средняя сравниваются с ценой, а не с числом
+    right = spec.get("right")
+    if right is None and "value" not in spec and "right" in norm.get("long", {}):
+        # цена / средняя / полоса без числа — с чем сравнивает сайт (цена ниже нижней полосы)
+        right = {k: v for k, v in norm["long"]["right"].items() if k != "type"}
+    if right is not None:
+        if not isinstance(right, dict) or "ind" not in right or set(right) - {"ind"} - set(IND_KEYS):
+            sys.exit("Условие %s: right должен быть {\"ind\": ..., параметры: %s}"
+                     % (ind, ", ".join(IND_KEYS)))
+        ind_meta(right["ind"], data)
     same_norm = norm.get("long", {}).get("op") == norm.get("short", {}).get("op")
 
     axes = {"tf": as_list(spec.get("tf", entry_tfs_of(cfg, data)))}
     for k in IND_KEYS:
         if k in spec:
             axes[k] = as_list(spec[k])
+        if right and k in right:
+            axes["right." + k] = as_list(right[k])
     for k in ("op", "value"):
         if short and ("short_" + k) in spec:
             axes["short_" + k] = as_list(spec["short_" + k])
         elif k in spec:
             axes[k] = as_list(spec[k])
+    check_params(ind, axes, "", data)
+    if right:
+        check_params(right["ind"], axes, "right.", data)
 
     out = []
     for combo in itertools.product(*axes.values()):
         a = dict(zip(axes, combo))
         ip = {k: a[k] for k in IND_KEYS if k in a}
+        width = ind == "bb" and ip.get("line") == "width"     # ширина полос, %, — одна для обеих сторон
+        if ind == "bb" and not width:
+            ip.setdefault("line", "lower")
+            if short:
+                ip["line"] = BB_FLIP.get(ip["line"], ip["line"])
+        keep = same_norm or width
         if "short_op" in a:
             op = a["short_op"]
         elif "op" in a:
-            op = a["op"] if (not short or same_norm) else FLIP_OP.get(a["op"], a["op"])
-        elif vs_price:
-            op = "gt" if short else "lt"
-        else:
+            op = a["op"] if (not short or keep) else FLIP_OP.get(a["op"], a["op"])
+        elif side in norm and not width:
             op = norm[side]["op"]
-        if vs_price:
-            if ind == "bb" and "line" not in ip:
-                ip["line"] = "upper" if short else "lower"
-            f = {"left": {"ind": "price"}, "op": op,
-                 "right": dict({"type": "ind", "ind": ind}, **ip), "tf": a["tf"]}
-            label = "price %s %s(%s)" % (op, ind, ",".join(num_text(v) for v in ip.values()))
+        else:
+            op = "lt" if short and not keep else "gt"
+        if right:
+            rind = right["ind"]
+            rp = {k: a["right." + k] for k in IND_KEYS if "right." + k in a}
+            if rind == "bb" and rp.get("line") != "width":
+                rp.setdefault("line", "lower")
+                if short:
+                    rp["line"] = BB_FLIP.get(rp["line"], rp["line"])
+            rhs, rtext = dict({"type": "ind", "ind": rind}, **rp), ind_text(rind, rp)
         else:
             if "short_value" in a:
                 value = a["short_value"]
             elif "value" in a:
                 value = a["value"]
-                if short and not same_norm:
+                # уровни цены (unit «цена») не зеркалятся: 50 000 в лонг — 50 000 и в шорт
+                if short and not keep and meta.get("unit") != "цена":
                     lo, hi = meta.get("scale", [0, 0])
                     value = round(lo + hi - value, 6)
-            else:
+            elif "value" in norm.get(side, {}) and not width:
                 value = norm[side]["value"]
-            f = {"left": dict({"ind": ind}, **ip), "op": op,
-                 "right": {"type": "const", "value": value}, "tf": a["tf"]}
-            label = "%s(%s) %s %s" % (ind, ",".join(num_text(v) for v in ip.values()),
-                                     op, num_text(value))
-        out.append(("%s @%s" % (label, a["tf"]), [[f]]))
+            else:
+                sys.exit("Условие %s: укажите value или right (с чем сравнивать)" % ind)
+            rhs, rtext = {"type": "const", "value": value}, num_text(value)
+        f = {"left": dict({"ind": ind}, **ip), "op": op, "right": rhs, "tf": a["tf"]}
+        out.append(("%s %s %s @%s" % (ind_text(ind, ip), op, rtext, a["tf"]), [[f]]))
     return out
 
 

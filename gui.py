@@ -71,6 +71,10 @@ MAX_PARAM_SETS = 100000   # наборов параметров во всей с
 LEFT_LIMIT = 300000       # до стольки прогонов фоном считаем, сколько уже есть в CSV
 
 INDICATORS_EXAMPLE = '[\n  {"ind": "rsi", "period": [7, 14], "value": [25, 30], "tf": [15, 60]}\n]'
+# параметры индикатора в окне ⚙: числа пишутся в поле (можно несколько через запятую),
+# остальное — кнопками (можно несколько)
+NUM_PARAMS = {"period": True, "hours": True, "mult": False}     # ключ -> целое?
+FORM_KEYS = {"ind", "tf", "op", "value", "right"} | set(gbt.IND_KEYS)
 SETS_EXAMPLE = '[\n  {"orders": 15, "price_overlap": 25, "price_factor": 1.6}\n]'
 
 
@@ -167,6 +171,12 @@ def short_list(names, total_label, total):
     if len(names) == total and total > 1:
         return "%s (%d)" % (total_label, total)
     return ", ".join(names[:4]) + (" +%d" % (len(names) - 4) if len(names) > 4 else "")
+
+
+def one(vals):
+    """[x] -> x: в конфиге одно значение пишется без списка."""
+    vals = list(dict.fromkeys(vals))
+    return vals[0] if len(vals) == 1 else vals
 
 
 # ---------- элементы в стиле сайта ----------
@@ -523,6 +533,497 @@ class Results(tk.Toplevel):
             self.tree.heading(c, text=title + arrow)
 
 
+# ---------- «Свои условия» ----------
+# Условие в окне — словарь: ind, tf [мин], op, value (текст: числа через запятую),
+# p {параметр: текст | [варианты]}, shift (текст), keep — параметры, заданные явно (из конфига
+# или нормы сайта: в запрос идут, даже если равны умолчанию), right — None или {ind, p, shift, keep}.
+
+def ind_info(data, ind):
+    return next((c for c in data["catalog"] if c["id"] == ind), None)
+
+
+def param_caption(meta, k):
+    return {"period": "Период, свечей", "hours": "За сколько часов",
+            "mult": "Ширина полос, σ" if meta["id"] == "bb" else "Множитель",
+            "method": "Тип средней", "price": "Считать по цене",
+            "line": meta.get("line_caption", "Линия")}.get(k, k)
+
+
+def param_defaults(meta, given=None):
+    """Параметры индикатора для окна; given — значения из конфига или нормы сайта."""
+    p = {}
+    for k in meta.get("params", []):
+        vals = gbt.as_list((given or {}).get(k, meta.get("defaults", {}).get(k)))
+        p[k] = fmt_vals(vals) if k in NUM_PARAMS else list(vals)
+    return p
+
+
+def norm_cond(data, ind, tf=(60,), shift="0"):
+    """Новое условие по норме сайта для лонга: RSI ниже 30, цена ниже нижней полосы…"""
+    n = data["norms"].get(ind, {}).get("long", {})
+    c = {"ind": ind, "tf": list(tf), "shift": shift, "p": param_defaults(ind_info(data, ind)), "keep": [],
+         "op": n.get("op", "gt"), "value": fmt_vals([n["value"]]) if "value" in n else "", "right": None}
+    if "right" in n:
+        c["right"] = norm_side(data, n["right"])
+    elif not c["value"]:
+        c["value"] = "0"
+    return c
+
+
+def norm_side(data, r):
+    """Правая часть по норме сайта ({"ind": "bb", "period": 20, …}) -> индикатор окна."""
+    return {"ind": r["ind"], "shift": "0", "p": param_defaults(ind_info(data, r["ind"]), r),
+            "keep": [k for k in r if k in gbt.IND_KEYS]}
+
+
+def side_spec(data, ind, p, shift, keep, where):
+    """Индикатор условия (левый или правый) -> {"ind": ..., параметры} для gbt."""
+    meta = ind_info(data, ind)
+    out = {"ind": ind}
+    for k in meta.get("params", []):
+        cap = param_caption(meta, k)
+        if k in NUM_PARAMS:
+            try:
+                vals = [num(t, NUM_PARAMS[k]) for t in pieces(p.get(k, ""))]
+            except ValueError as e:
+                raise ValueError("%s: %s — %s" % (where, cap, e))
+        else:
+            vals = list(p.get(k) or [])
+        if not vals:
+            raise ValueError("%s: %s — пусто" % (where, cap))
+        # значение по умолчанию сервер подставит сам, как у готовых связок; без него запрос
+        # тот же, что из конфига, и досчёт узнаёт уже посчитанное
+        if k in keep or one(vals) != meta.get("defaults", {}).get(k):
+            out[k] = one(vals)
+    try:
+        shifts = [num(t, True) for t in pieces(shift)]
+    except ValueError as e:
+        raise ValueError("%s: сдвиг — %s" % (where, e))
+    if shifts and (shifts != [0] or "shift" in keep):
+        out["shift"] = one(shifts)
+    return out
+
+
+def cond_spec(data, c, where):
+    """Условие окна -> условие gbt (indicators)."""
+    s = side_spec(data, c["ind"], c["p"], c["shift"], c["keep"], where)
+    if not c["tf"]:
+        raise ValueError("%s: выберите размер свечей" % where)
+    s["tf"] = one(c["tf"])
+    s["op"] = c["op"]
+    if c["right"]:
+        r = c["right"]
+        s["right"] = side_spec(data, r["ind"], r["p"], r["shift"], r["keep"], where + ", справа")
+    else:
+        try:
+            vals = [num(t, False) for t in pieces(c["value"])]
+        except ValueError as e:
+            raise ValueError("%s: значение — %s" % (where, e))
+        if not vals:
+            raise ValueError("%s: впишите значение" % where)
+        s["value"] = one(vals)
+    return s
+
+
+def spec_side(meta, spec):
+    """Параметры индикатора из конфига -> (p, shift, keep) окна; None — параметр не этого индикатора."""
+    keys = [k for k in gbt.IND_KEYS if k in spec and k != "shift"]
+    if any(k not in meta.get("params", []) for k in keys):
+        return None
+    return (param_defaults(meta, {k: spec[k] for k in keys}), fmt_vals(gbt.as_list(spec.get("shift", 0))),
+            [k for k in gbt.IND_KEYS if k in spec])
+
+
+def spec_cond(data, spec, tfs):
+    """Условие из конфига -> условие окна; None — в окне его не показать (short_value и т.п.)."""
+    if not isinstance(spec, dict) or "ind" not in spec or set(spec) - FORM_KEYS:
+        return None
+    spec = gbt.plain_leaf(spec)
+    meta = ind_info(data, spec["ind"])
+    tf = gbt.as_list(spec.get("tf", tfs))
+    if not meta or not tf or any(t not in dict(TFS) for t in tf):
+        return None
+    side = spec_side(meta, spec)
+    op = spec.get("op")
+    if side is None or (op is not None and (not isinstance(op, str) or op not in data["ops"])):
+        return None
+    c = norm_cond(data, spec["ind"], tf)
+    c["p"], c["shift"], c["keep"] = side
+    if op:
+        c["op"] = op
+    if "right" in spec:
+        r = spec["right"]
+        rmeta = isinstance(r, dict) and ind_info(data, r.get("ind"))
+        rside = rmeta and not set(r) - {"ind"} - set(gbt.IND_KEYS) and spec_side(rmeta, r)
+        if not rside:
+            return None
+        c["right"] = dict(zip(("p", "shift", "keep"), rside), ind=r["ind"])
+        c["value"] = ""
+    elif "value" in spec:
+        c["right"] = None
+        c["value"] = fmt_vals(gbt.as_list(spec["value"]))
+    return c
+
+
+def rule_groups(data, rule, tfs):
+    """Правило из конфига -> группы условий окна; None — правило окну не по силам."""
+    if not isinstance(rule, dict):
+        return None
+    if "ind" in rule:
+        raw = [[rule]]
+    elif set(rule) == {"all"}:
+        raw = [rule["all"]]
+    elif set(rule) == {"any"} and isinstance(rule["any"], list):
+        raw = []
+        for x in rule["any"]:
+            if isinstance(x, dict) and "ind" in x:
+                raw.append([x])
+            elif isinstance(x, dict) and set(x) == {"all"}:
+                raw.append(x["all"])
+            else:
+                return None
+    else:
+        return None
+    lim = data["entry_limits"]
+    if not raw or len(raw) > lim["groups"]:
+        return None
+    groups = []
+    for g in raw:
+        if not isinstance(g, list) or not g or len(g) > lim["filters"]:
+            return None
+        conds = [spec_cond(data, s, tfs) for s in g]
+        if any(c is None for c in conds):
+            return None
+        groups.append(conds)
+    return groups
+
+
+def groups_rule(data, groups):
+    """Группы условий окна -> одно правило gbt: условие, {"all": [...]} или {"any": [...]}."""
+    parts, n = [], 0
+    for conds in groups:
+        specs = []
+        for c in conds:
+            n += 1
+            specs.append(cond_spec(data, c, "Условие %d (%s)" % (n, ind_info(data, c["ind"])["name"])))
+        parts.append(specs[0] if len(specs) == 1 else {"all": specs})
+    return parts[0] if len(parts) == 1 else {"any": parts}
+
+
+def mini(parent, text, command, fg=ACCENT):
+    """Маленькая кнопка-значок (⚙, ×), как .mini на сайте."""
+    return tk.Button(parent, text=text, command=command, bg=CHIP, fg=fg, activebackground=CHIP_HOVER,
+                     activeforeground=fg, relief="flat", bd=0, font=(FONT, 9, "bold"), width=2,
+                     cursor="hand2")
+
+
+class ScrollBox(tk.Frame):
+    """Рамка растёт по содержимому до max_h, дальше — прокрутка колесом и полосой."""
+
+    def __init__(self, parent, max_h):
+        super().__init__(parent, bg=PANEL)
+        self.max_h = max_h
+        self.canvas = tk.Canvas(self, bg=PANEL, highlightthickness=0, bd=0, width=1, height=1)
+        self.sb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.sb.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.inner = tk.Frame(self.canvas, bg=PANEL)
+        self.canvas.create_window(0, 0, window=self.inner, anchor="nw", tags="inner")
+        self.inner.bind("<Configure>", self._fit)
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfig("inner", width=e.width))
+        self.bind_all("<MouseWheel>", self._wheel_any, add="+")
+
+    def _fit(self, _e=None):
+        w, h = self.inner.winfo_reqwidth(), self.inner.winfo_reqheight()
+        self.canvas.config(width=w, height=min(h, self.max_h), scrollregion=(0, 0, w, h))
+        if h > self.max_h:
+            self.sb.pack(side="right", fill="y")
+        else:
+            self.sb.pack_forget()
+            self.canvas.yview_moveto(0)
+
+    def wheel(self, e):
+        if self.inner.winfo_reqheight() > self.max_h:
+            self.canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+        return "break"
+
+    def _wheel_any(self, e):
+        # путь окна под мышью строкой: winfo_containing падает на внутренних окнах Tk
+        # (выпадающий список Combobox — «popdown»), которых tkinter не знает
+        path = str(self.tk.call("winfo", "containing", e.x_root, e.y_root))
+        me = str(self)
+        # над открытым списком колесо листает сам список, а не условия под ним
+        if (path == me or path.startswith(me + ".")) and ".popdown" not in path:
+            return self.wheel(e)
+
+
+class ParamFields:
+    """Параметры индикатора в окне ⚙: числа — полем, остальное — кнопками, и сдвиг."""
+
+    def __init__(self, parent, data, ind, p, shift):
+        meta = ind_info(data, ind)
+        self.frame = tk.Frame(parent, bg=PANEL)
+        self.getters = {}
+        r = 0
+        for k in meta.get("params", []):
+            tk.Label(self.frame, text=param_caption(meta, k), bg=PANEL, fg=TEXT, font=(FONT, 9)).grid(
+                row=r, column=0, sticky="w", padx=(0, 10), pady=3)
+            if k in NUM_PARAMS:
+                var = tk.StringVar(value=p.get(k, ""))
+                ttk.Entry(self.frame, textvariable=var, width=16, font=(FONT, 10)).grid(
+                    row=r, column=1, sticky="w")
+                self.getters[k] = var.get
+            else:
+                items = {"method": data["methods"], "price": data["prices"]}.get(k) or meta.get("lines", {})
+                tg = ToggleGroup(self.frame, [(v, t.split(" (")[0]) for v, t in items.items()],
+                                 on=p.get(k) or ())
+                tg.frame.grid(row=r, column=1, sticky="w")
+                self.getters[k] = tg.get
+            r += 1
+        tk.Label(self.frame, text="Смотреть на N свечей назад", bg=PANEL, fg=TEXT, font=(FONT, 9)).grid(
+            row=r, column=0, sticky="w", padx=(0, 10), pady=3)
+        self.shift = tk.StringVar(value=shift)
+        ttk.Entry(self.frame, textvariable=self.shift, width=16, font=(FONT, 10)).grid(
+            row=r, column=1, sticky="w")
+
+    def get(self):
+        return {k: f() for k, f in self.getters.items()}, self.shift.get()
+
+
+class CondDialog(tk.Toplevel):
+    """⚙ у условия, как на сайте: свечи, параметры индикатора, сдвиг и с чем сравнивать."""
+
+    def __init__(self, root, data, cond, on_done):
+        super().__init__(root, bg=PANEL, padx=16, pady=14)
+        self.data, self.c, self.on_done = data, cond, on_done
+        self.title("Настройки условия")
+        self.transient(root)
+        self.resizable(False, False)
+
+        h2(self, ind_info(data, cond["ind"])["name"])
+        field_label(self, "Свечи какого размера").pack(anchor="w", pady=(0, 3))
+        self.tf = ToggleGroup(self, TFS, on=cond["tf"])
+        self.tf.frame.pack(anchor="w")
+        self.left = ParamFields(self, data, cond["ind"], cond["p"], cond["shift"])
+        self.left.frame.pack(fill="x", pady=(8, 0))
+
+        h2(self, "Сравнить с", second=True)
+        self.mode = ToggleGroup(self, [("const", "числом"), ("ind", "индикатором")],
+                                on=("ind" if cond["right"] else "const",), multi=False,
+                                command=lambda _v: self._show_right())
+        self.mode.frame.pack(anchor="w")
+        self.rbox = tk.Frame(self, bg=PANEL)
+        self.rbox.pack(fill="x")
+        self.right, self.rfields = dict(cond["right"] or self._default_right()), None
+        self._show_right()
+
+        hint(self, "Несколько значений — через запятую, несколько кнопок — переберутся все "
+                   "сочетания. Настройки — для Long; для Short условие и полоса Боллинджера "
+                   "зеркалятся сами.", wrap=440).pack(fill="x", pady=(12, 0))
+        primary(self, "Готово", self._done).pack(fill="x", pady=(10, 0))
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.bind("<Return>", lambda _e: self._done())
+        self.update_idletasks()
+        self.geometry("+%d+%d" % (root.winfo_rootx() + 380, root.winfo_rooty() + 80))
+        try:
+            self.wait_visibility()
+            self.grab_set()
+        except tk.TclError:
+            pass
+
+    def _default_right(self):
+        """С чем сравнивает сайт (у цены — нижняя полоса), иначе — средняя EMA(20)."""
+        return norm_side(self.data, self.data["norms"].get(self.c["ind"], {}).get("long", {}).get("right")
+                         or {"ind": "ma"})
+
+    def _keep_right(self):
+        if self.rfields:
+            self.right["p"], self.right["shift"] = self.rfields.get()
+        self.rfields = None
+
+    def _show_right(self):
+        self._keep_right()
+        for w in self.rbox.winfo_children():
+            w.destroy()
+        if self.mode.get() != ["ind"]:
+            hint(self.rbox, "Число — в строке условия; можно несколько через запятую.").pack(
+                fill="x", pady=(6, 0))
+            return
+        cat = self.data["catalog"]
+        cb = ttk.Combobox(self.rbox, values=[c["name"] for c in cat], state="readonly", width=34,
+                          font=(FONT, 9))
+        cb.current(next(i for i, c in enumerate(cat) if c["id"] == self.right["ind"]))
+        cb.pack(anchor="w", pady=(8, 0))
+
+        def picked(_e):
+            self.rfields = None
+            ind = cat[cb.current()]["id"]
+            self.right = norm_side(self.data, {"ind": ind})
+            self.after_idle(self._show_right)
+        cb.bind("<<ComboboxSelected>>", picked)
+        self.rfields = ParamFields(self.rbox, self.data, self.right["ind"], self.right["p"],
+                                   self.right["shift"])
+        self.rfields.frame.pack(fill="x", pady=(6, 0))
+
+    def _done(self):
+        c = self.c
+        c["tf"] = self.tf.get()
+        c["p"], c["shift"] = self.left.get()
+        if self.mode.get() == ["ind"]:
+            self._keep_right()
+            c["right"] = self.right
+        else:
+            c["right"] = None
+            if not c["value"].strip():
+                c["value"] = norm_cond(self.data, c["ind"])["value"] or "0"
+        self.destroy()
+        self.on_done()
+
+
+class CondForm:
+    """«Свои условия», как на сайте: условия группы — все сразу («И»), группы — любая («ИЛИ»).
+    Отличие от сайта: в полях можно несколько значений через запятую, а размеров свечей —
+    несколько кнопок; переберутся все сочетания."""
+
+    def __init__(self, parent, app):
+        self.app = app
+        self.groups = []
+        self.frame = ScrollBox(parent, max_h=330)
+        self.box = self.frame.inner
+
+    def changed(self):
+        self.render()
+        self.app._schedule()
+
+    def add(self, gi=None):
+        data = self.app.data
+        if gi is None:
+            self.groups.append([norm_cond(data, "rsi")])
+        else:
+            self.groups[gi].append(norm_cond(data, "rsi", self.groups[gi][-1]["tf"]))
+        self.changed()
+
+    def drop(self, gi, ci=None):
+        if ci is not None:
+            del self.groups[gi][ci]
+        if ci is None or not self.groups[gi]:
+            del self.groups[gi]
+        self.changed()
+
+    def rules(self):
+        """[] или [правило gbt]; ошибка в полях -> ValueError."""
+        return [groups_rule(self.app.data, self.groups)] if self.groups else []
+
+    def render(self):
+        for w in self.box.winfo_children():
+            w.destroy()
+        data = self.app.data
+        if not data:
+            hint(self.box, "Справочник индикаторов не загружен — «Обновить пары».").pack(
+                fill="x", pady=(10, 0))
+            return
+        lim = data["entry_limits"]
+        many = len(self.groups) > 1
+        for gi, conds in enumerate(self.groups):
+            if gi:
+                tk.Label(self.box, text="ИЛИ", bg=PANEL, fg=ACCENT, font=(FONT, 9, "bold")).pack(
+                    pady=(6, 0))
+            # как на сайте: рамка и «Группа N» — только когда групп несколько
+            g = tk.Frame(self.box, bg=PANEL, highlightthickness=1 if many else 0,
+                         highlightbackground=LINE, padx=8 if many else 0, pady=4 if many else 0)
+            g.pack(fill="x", pady=(10 if not gi else 4, 0))
+            if many:
+                head = tk.Frame(g, bg=PANEL)
+                head.pack(fill="x")
+                tk.Label(head, text="Группа %d" % (gi + 1), bg=PANEL, fg=TEXT,
+                         font=(FONT, 9, "bold")).pack(side="left")
+                mini(head, "×", lambda gi=gi: self.drop(gi), fg=MINUS).pack(side="right")
+            for ci, c in enumerate(conds):
+                self._row(g, gi, ci, c)
+            if len(conds) < lim["filters"]:
+                ghost(g, "Добавить фильтр", lambda gi=gi: self.add(gi)).box.pack(anchor="w", pady=(6, 0))
+        if not self.groups:
+            ghost(self.box, "Добавить фильтр", self.add).box.pack(anchor="w", pady=(10, 0))
+        elif len(self.groups) < lim["groups"]:
+            ghost(self.box, "Добавить группу ИЛИ", self.add).box.pack(anchor="w", pady=(8, 0))
+
+    def _row(self, parent, gi, ci, c):
+        data = self.app.data
+        cat = data["catalog"]
+        ops = list(data["ops"].items())
+        row = tk.Frame(parent, bg=PANEL)
+        row.pack(fill="x", pady=(6, 0))
+        row.columnconfigure(0, weight=1)
+
+        ind = ttk.Combobox(row, values=[x["name"] for x in cat], state="readonly", width=18, font=(FONT, 9))
+        ind.current(next(i for i, x in enumerate(cat) if x["id"] == c["ind"]))
+        ind.bind("<<ComboboxSelected>>", lambda _e: self._set_ind(c, cat[ind.current()]["id"]))
+        ind.grid(row=0, column=0, sticky="ew")
+
+        op = ttk.Combobox(row, values=[t for _, t in ops], state="readonly", width=16, font=(FONT, 9))
+        op.current(next((i for i, (k, _) in enumerate(ops) if k == c["op"]), 0))
+        op.bind("<<ComboboxSelected>>", lambda _e: (c.update(op=ops[op.current()][0]), self.app._schedule()))
+        op.grid(row=0, column=1, padx=(4, 0))
+        boxes = [ind, op]
+
+        if c["right"]:
+            name = ind_info(data, c["right"]["ind"])["name"]
+            tk.Label(row, text=name if len(name) <= 12 else name[:11] + "…", bg=PANEL, fg=TEXT,
+                     font=(FONT, 9), width=10, anchor="w").grid(row=0, column=2, padx=(4, 0))
+        else:
+            var = tk.StringVar(value=c["value"])
+            var.trace_add("write", lambda *_a: (c.update(value=var.get()), self.app._schedule()))
+            levels = data["norms"].get(c["ind"], {}).get("levels", [])
+            # как на сайте: уровни на выбор, своё число (или несколько через запятую) — вписать
+            val = ttk.Combobox(row, textvariable=var, values=[fmt_vals([v]) for v in levels], width=9,
+                               font=(FONT, 9))
+            val.grid(row=0, column=2, padx=(4, 0))
+            boxes.append(val)
+        for b in boxes:
+            b.bind("<MouseWheel>", self.frame.wheel)     # колесо листает условия, а не меняет выбор
+        mini(row, "⚙", lambda: CondDialog(self.app.root, data, c, self.changed)).grid(
+            row=0, column=3, padx=(4, 0))
+        mini(row, "×", lambda: self.drop(gi, ci), fg=MINUS).grid(row=0, column=4, padx=(4, 0))
+        hint(row, self._summary(c), wrap=420).grid(row=1, column=0, columnspan=5, sticky="w")
+
+    def _set_ind(self, c, ind):
+        """Сменили индикатор — условие и уровень по норме сайта; свечи и сдвиг остаются."""
+        new = norm_cond(self.app.data, ind, c["tf"], c["shift"])
+        c.clear()
+        c.update(new)
+        self.app.root.after_idle(self.changed)    # строку пересобираем не внутри её же события
+
+    def _params_text(self, ind, p, shift):
+        data = self.app.data
+        meta = ind_info(data, ind)
+        bits = []
+        for k in meta.get("params", []):
+            v = p.get(k)
+            if k == "period":
+                bits.append("период %s" % v)
+            elif k == "hours":
+                bits.append("за %s ч" % v)
+            elif k == "mult":
+                bits.append("%s %s" % ("σ" if ind == "bb" else "множитель", v))
+            else:
+                names = {"method": data["methods"], "price": data["prices"]}.get(k) or meta.get("lines", {})
+                bits.append(", ".join(names.get(x, x).split(" (")[0] for x in v or ()))
+        if pieces(shift) not in ([], ["0"]):
+            bits.append("сдвиг %s" % shift)
+        return bits
+
+    def _summary(self, c):
+        tfs = dict(TFS)
+        text = " · ".join(["свечи " + ", ".join(tfs.get(t, str(t)) for t in c["tf"])]
+                          + self._params_text(c["ind"], c["p"], c["shift"]))
+        if c["right"]:
+            r = c["right"]
+            bits = self._params_text(r["ind"], r["p"], r["shift"])
+            text += " · с: %s%s" % (ind_info(self.app.data, r["ind"])["name"],
+                                    " (%s)" % ", ".join(bits) if bits else "")
+        return text
+
+
 # ---------- окно ----------
 
 class App:
@@ -588,6 +1089,13 @@ class App:
                      lightcolor=PANEL, darkcolor=PANEL, padding=(6, 4), insertcolor=TEXT)
         st.map("TEntry", bordercolor=[("focus", ACCENT)], lightcolor=[("focus", ACCENT)],
                fieldbackground=[("disabled", "#f2f4f6")], foreground=[("disabled", "#9aa3ae")])
+        st.configure("TCombobox", fieldbackground=PANEL, background=PANEL, foreground=TEXT,
+                     bordercolor=FIELD, lightcolor=PANEL, darkcolor=PANEL, arrowcolor=DIM,
+                     padding=(4, 3))
+        st.map("TCombobox", bordercolor=[("focus", ACCENT)],
+               fieldbackground=[("readonly", PANEL)], selectbackground=[("readonly", PANEL)],
+               selectforeground=[("readonly", TEXT)])
+        self.root.option_add("*TCombobox*Listbox.font", (FONT, 9))
         st.configure("TCheckbutton", background=PANEL, foreground=TEXT, font=(FONT, 9),
                      indicatorbackground=PANEL, indicatorforeground=ACCENT)
         st.map("TCheckbutton", background=[("active", PANEL)])
@@ -671,12 +1179,11 @@ class App:
 
         # --- точка входа ---
         h2(p, "Точка входа", second=True)
+        # как на сайте: способ входа один — кнопки переключают вкладки, а не отмечают несколько
         self.modes = ToggleGroup(p, [("none", "Всегда в рынке"), ("tpl", "Готовые связки"),
-                                     ("own", "Свои условия")], on=("none",),
-                                 command=lambda _v: (self._refresh_entry(), self._schedule()),
-                                 stretch=True)
+                                     ("own", "Свои условия")], on=("none",), multi=False,
+                                 command=self._mode_clicked, stretch=True)
         self.modes.frame.pack(fill="x")
-        hint(p, "Можно включить несколько — переберутся все.").pack(fill="x", pady=(4, 0))
 
         self.ent_body = tk.Frame(p, bg=PANEL)
         self.ent_body.pack(fill="x")
@@ -703,18 +1210,58 @@ class App:
         self.ent_tf.frame.pack(anchor="w")
 
         self.pane_own = tk.Frame(self.ent_body, bg=PANEL)
-        r = tk.Frame(self.pane_own, bg=PANEL)
-        r.pack(fill="x", pady=(10, 3))
-        field_label(r, "Свои условия (indicators, JSON)").pack(side="left")
-        ghost(r, "Пример", lambda: self._put_example(self.ind_text, INDICATORS_EXAMPLE)).box.pack(side="right")
-        box = tk.Frame(self.pane_own, bg=FIELD)
-        box.pack(fill="x")
-        self.ind_text = tk.Text(box, height=6, width=40, wrap="none", font=("Consolas", 9),
+        self.form = CondForm(self.pane_own, self)
+        self.form.frame.pack(fill="x")
+        hint(self.pane_own, "Условия группы — все сразу («И»), группы — любая («ИЛИ»). Условие и "
+                            "число — для Long, для Short зеркалятся сами (RSI < 30 → > 70). Через "
+                            "запятую и кнопками ⚙ — несколько значений: переберутся все.").pack(
+            fill="x", pady=(6, 0))
+        self.json_btn = ghost(self.pane_own, "", self._show_json)
+        self.json_btn.box.pack(anchor="w", pady=(8, 0))
+        self.json_filled = False
+
+        # ещё правила JSON — отдельным окном, как «Дополнительно»: в колонке им нет места
+        w = self.json_win = tk.Toplevel(self.root, bg=PANEL, padx=16, pady=14)
+        w.withdraw()
+        w.title("Правила JSON")
+        w.transient(self.root)
+        w.protocol("WM_DELETE_WINDOW", self._hide_json)
+        head = h2(w, "Ещё правила (indicators, JSON)")
+        ghost(head, "Пример", lambda: self._put_example(self.ind_text, INDICATORS_EXAMPLE)).box.pack(side="right")
+        box = tk.Frame(w, bg=FIELD)
+        box.pack(fill="both", expand=True)
+        self.ind_text = tk.Text(box, height=14, width=70, wrap="none", font=("Consolas", 9),
                                 bd=0, highlightthickness=0, bg=PANEL, fg=TEXT, insertbackground=TEXT)
-        self.ind_text.pack(fill="x", padx=1, pady=1)
+        self.ind_text.pack(fill="both", expand=True, padx=1, pady=1)
         self._watch_text(self.ind_text)
-        hint(self.pane_own, "Поля и примеры — в README. Без tf берётся «Интервал связки».").pack(
-            fill="x", pady=(4, 0))
+        hint(w, "Каждое правило — отдельный вариант входа, в дополнение к условиям в окне. Поля и "
+                "примеры — в README. Без tf берётся «Интервал связки».", wrap=500).pack(fill="x", pady=(4, 0))
+        primary(w, "Готово", self._hide_json).pack(fill="x", pady=(10, 0))
+        self._json_label()
+
+    def _show_json(self):
+        self.json_win.deiconify()
+        self.json_win.lift()
+        self.json_win.geometry("+%d+%d" % (self.root.winfo_rootx() + 420, self.root.winfo_rooty() + 120))
+        self.ind_text.focus_set()
+
+    def _hide_json(self):
+        self.json_win.withdraw()
+        self._schedule()
+
+    def _json_label(self):
+        filled = bool(self.ind_text.get("1.0", "end").strip())
+        self.json_btn.config(text="Ещё правила JSON…" + (" ●" if filled else ""))
+        if filled != self.json_filled:
+            self.json_filled = filled
+            self._refresh_entry()
+
+    def _mode_clicked(self, _v):
+        # включили «Свои условия» — сразу одно условие, как на сайте
+        if "own" in self.modes.get() and not self.form.groups and self.data:
+            self.form.add()
+        self._refresh_entry()
+        self._schedule()
 
     def _refresh_entry(self):
         modes = self.modes.get()
@@ -724,7 +1271,8 @@ class App:
             self.pane_none.pack(fill="x")
         if "tpl" in modes:
             self.pane_tpl.pack(fill="x")
-        if "tpl" in modes or "own" in modes:
+        # у своих условий свечи — в ⚙ каждого; общий интервал нужен связкам и правилам JSON без tf
+        if "tpl" in modes or ("own" in modes and self.json_filled):
             self.pane_tf.pack(fill="x")
         if "own" in modes:
             self.pane_own.pack(fill="x")
@@ -1070,6 +1618,7 @@ class App:
                 row["limit"] = (norm(float(lim[0])), norm(float(lim[1])))
         self._update_pickers()
         self._refresh_entry()
+        self.form.render()
         self._show_period()
         self._schedule()
         if say:
@@ -1236,9 +1785,12 @@ class App:
                 entries += tpls
             indicators = None
             if "own" in modes:
-                indicators = parse_json_list(self.ind_text.get("1.0", "end"), "Свои условия")
+                if not self.data:
+                    raise ValueError("Свои условия: справочник индикаторов не загружен — «Обновить пары»")
+                indicators = self.form.rules() + (
+                    parse_json_list(self.ind_text.get("1.0", "end"), "Правила JSON") or [])
                 if not indicators:
-                    raise ValueError("Свои условия: впишите правила (кнопка «Пример») или выключите кнопку")
+                    raise ValueError("Свои условия: добавьте условие или выключите кнопку")
 
             swing = [1]
             if "swing" in entries:
@@ -1358,6 +1910,7 @@ class App:
 
     def _recalc(self):
         self._recalc_id = None
+        self._json_label()
         for key in PARAM_NAMES + ["stop_loss"]:
             lbl = self.reinvest_count if key == "reinvest" else self.rows[key]["count"]
             try:
@@ -1596,14 +2149,31 @@ class App:
             modes = (["none"] if "none" in names else []) \
                 + (["tpl"] if tpls or en == "all" else []) \
                 + (["own"] if cfg.get("indicators") else [])
-            self.modes.set(modes or ["none"])
+            # в окне способ входа один: берём последний (свои условия > связки > всегда в рынке)
+            mode = (modes or ["none"])[-1]
+            if len(modes) > 1:
+                titles = {"none": "«Всегда в рынке»", "tpl": "«Готовые связки»", "own": "«Свои условия»"}
+                self.say("В конфиге несколько способов входа — в окне один: %s; пропущены %s."
+                         % (titles[mode], ", ".join(titles[m] for m in modes[:-1])), "warn")
+            self.modes.set([mode])
             if en == "all":       # все связки; до загрузки справочника — выберутся при загрузке
                 self.sel_tpls = set(self._tpl_ids()) or None
             elif tpls:
                 self.sel_tpls = set(tpls)
+            # первое правило, если окну по силам, — в форму условий, остальные — в JSON
+            rest = gbt.as_list(cfg.get("indicators") or [])
+            groups = None
+            if rest and self.data:
+                groups = rule_groups(self.data, rest[0], gbt.entry_tfs_of(cfg, self.data))
+                if groups is not None:
+                    rest = rest[1:]
+            self.form.groups = groups or []
+            self.form.render()
             self.ind_text.delete("1.0", "end")
-            if cfg.get("indicators"):
-                self.ind_text.insert("1.0", json.dumps(cfg["indicators"], ensure_ascii=False, indent=2))
+            if rest:
+                self.ind_text.insert("1.0", "[\n  %s\n]" % ",\n  ".join(     # правило — строка
+                    json.dumps(r, ensure_ascii=False) for r in rest))
+            self._json_label()
 
             self._set_tfs(self.ent_tf, cfg.get("entry_tfs", [60]), "Интервал связки")
             self._set_tfs(self.chart_tf, cfg.get("chart_tfs", [60]), "Пауза перезахода")
