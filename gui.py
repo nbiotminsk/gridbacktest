@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: UP031 — строки форматируются через %, как во всём проекте
 """GUI для массовых бэктестов gridbacktest.com (см. README.md).
 
 Запуск: gui.bat  (или python gui.py).
@@ -12,15 +13,16 @@
 
 import csv
 import json
+import math
 import os
 import queue
 import re
 import subprocess
 import sys
 import threading
-import traceback
+import time
 import tkinter as tk
-from datetime import datetime
+import traceback
 from tkinter import filedialog, messagebox, ttk
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -28,7 +30,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 sys.dont_write_bytecode = True   # без __pycache__ в корне: там только программа
 
-import gbt  # noqa: E402
+import gbt
 
 CFG_PATH = os.path.join(gbt.CONFIGS_DIR, "sweep_gui.json")   # конфиг, с которым окно запускает прогон
 PAIRS_CACHE = os.path.join(gbt.DATA_DIR, "pairs_cache.json")
@@ -91,12 +93,12 @@ def num(text, integer):
         v = float(t)
     except ValueError:
         raise ValueError("«%s» — не число" % t)
-    if v != v or v in (float("inf"), float("-inf")):      # float() пропускает nan и inf
+    if not math.isfinite(v):      # float() пропускает nan и inf
         raise ValueError("«%s» — не число" % t)
     if integer:
         if abs(v - round(v)) > 1e-9:
             raise ValueError("нужно целое: %s" % t)
-        return int(round(v))
+        return round(v)
     return norm(v)
 
 
@@ -158,11 +160,11 @@ def plural(n, one, few, many):
 
 
 def spaced(n):
-    return "{:,}".format(n).replace(",", " ")
+    return f"{n:,}".replace(",", " ")
 
 
 def base(sym):
-    return sym[:-4] if sym.endswith("USDT") else sym
+    return sym.removesuffix("USDT")
 
 
 def short_list(names, total_label, total):
@@ -224,7 +226,7 @@ class ToggleGroup:
     def add(self, value, text, on=False):
         t = Toggle(self.frame, text, on=on, command=lambda _t, v=value: self._click(v))
         t.pack(side="left", padx=(0 if not self.btns else 4, 0),
-               fill="x" if self.stretch else None, expand=self.stretch)
+               fill="x" if self.stretch else "none", expand=self.stretch)
         self.btns[value] = t
         return t
 
@@ -251,10 +253,15 @@ class ToggleGroup:
             b.set(v in values)
 
 
+class BoxButton(tk.Button):
+    """Кнопка внутри рамки-подложки; упаковывать .box, а не саму кнопку."""
+    box: tk.Frame
+
+
 def ghost(parent, text, command, bg=PANEL):
     """Кнопка с рамкой, как button.ghost на сайте. Упаковывать .box."""
     box = tk.Frame(parent, bg=FIELD)
-    b = tk.Button(box, text=text, command=command, bg=bg, fg=ACCENT, activebackground=TINT,
+    b = BoxButton(box, text=text, command=command, bg=bg, fg=ACCENT, activebackground=TINT,
                   activeforeground=ACCENT, disabledforeground="#a3abb5", relief="flat", bd=0,
                   font=(FONT, 9, "bold"), padx=10, pady=4, cursor="hand2")
     b.pack(padx=1, pady=1, fill="both", expand=True)
@@ -296,7 +303,7 @@ def h2(parent, text, second=False):
 def pick_button(parent, command):
     """Поле-кнопка, как «Пара» на сайте: по нажатию — окно выбора с поиском."""
     box = tk.Frame(parent, bg=FIELD)
-    b = tk.Button(box, text="", command=command, bg=PANEL, fg=TEXT, activebackground=TINT,
+    b = BoxButton(box, text="", command=command, bg=PANEL, fg=TEXT, activebackground=TINT,
                   activeforeground=TEXT, relief="flat", bd=0, anchor="w", font=(FONT, 10),
                   padx=8, pady=4, cursor="hand2")
     b.pack(padx=1, pady=1, fill="both", expand=True)
@@ -403,14 +410,14 @@ class Picker(tk.Toplevel):
 class Results(tk.Toplevel):
     """Таблица результатов из CSV: сортировка по клику на заголовок, ликвидации по флажку."""
 
-    COLS = [("symbol", "Пара", 84), ("position", "Сторона", 58), ("price_overlap", "Перекр., %", 74),
+    COLS = (("symbol", "Пара", 84), ("position", "Сторона", 58), ("price_overlap", "Перекр., %", 74),
             ("orders", "Ордеров", 60), ("price_factor", "Коэф. цены", 78),
             ("volume_factor", "Коэф. объёма", 90), ("profit", "Тейк, %", 56), ("leverage", "Плечо", 48),
             ("reinvest", "Реинв., %", 64), ("stop_loss", "Стоп, %", 56), ("stop_hits", "Стопов", 62),
             ("_net", "Итог, %", 76), ("net_stop_worst_pct", "Хуже, %", 70), ("net_pct", "Без стопа, %", 88),
             ("max_drawdown", "Просадка, %", 82), ("entries", "Сделок", 56),
-            ("entry", "Вход", 160), ("liq_time", "Ликвидация", 180)]
-    TEXT_COLS = {"symbol", "position", "entry", "liq_time", "stop_hits"}
+            ("entry", "Вход", 160), ("liq_time", "Ликвидация", 180))
+    TEXT_COLS = frozenset({"symbol", "position", "entry", "liq_time", "stop_hits"})
 
     def __init__(self, root, path):
         super().__init__(root, bg=PANEL, padx=16, pady=14)
@@ -538,8 +545,9 @@ class Results(tk.Toplevel):
 # p {параметр: текст | [варианты]}, shift (текст), keep — параметры, заданные явно (из конфига
 # или нормы сайта: в запрос идут, даже если равны умолчанию), right — None или {ind, p, shift, keep}.
 
-def ind_info(data, ind):
-    return next((c for c in data["catalog"] if c["id"] == ind), None)
+def ind_info(data, ind) -> dict:
+    """Индикатор из справочника; {} — такого нет."""
+    return next((c for c in data["catalog"] if c["id"] == ind), {})
 
 
 def param_caption(meta, k):
@@ -1029,7 +1037,7 @@ class CondForm:
 class App:
     def __init__(self, root):
         self.root = root
-        self.data = None
+        self.data = {}                 # справочник сайта; пустой — ещё не загружен
         self.proc = None
         self.proc_args = None
         self.stopping = False
@@ -1300,7 +1308,7 @@ class App:
         sym = next((s for s in syms if self.data and s in self.data["pairs"]), None)
         text = "Последние %d %s каждой пары" % (y[0], plural(y[0], "год", "года", "лет"))
         if sym:
-            lo, hi, months = gbt.period_for(self.data["pairs"][sym], {"years": y[0]})
+            lo, hi, months = gbt.period_for(self.data["pairs"][sym], {"years": y[0]}) or ("", "", [])
             self._filling = True
             self.date_from.set(lo)
             self.date_to.set(hi)
@@ -1637,7 +1645,7 @@ class App:
         data, err = None, None
         try:
             data = gbt.get_data(gbt.new_session())
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — фоновый поток: любая ошибка сети — в журнал, окно живо
             err = e
         if data:
             try:
@@ -1657,7 +1665,7 @@ class App:
         def work():
             try:
                 me = gbt.get_me(gbt.load_session(), fresh=True)
-            except Exception:
+            except Exception:  # noqa: BLE001 — фоновый поток: «сервер недоступен», а не тишина
                 me = None
             self.q.put(("me", me))
         threading.Thread(target=work, daemon=True).start()
@@ -1754,7 +1762,7 @@ class App:
             lo, hi = self.date_from.get().strip(), self.date_to.get().strip()
             for t, nm in ((lo, "дата «с»"), (hi, "дата «по»")):
                 try:
-                    datetime.strptime(t, "%Y-%m-%d")
+                    time.strptime(t, "%Y-%m-%d")
                 except ValueError:
                     raise ValueError("%s: нужна дата ГГГГ-ММ-ДД, получено «%s»" % (nm, t))
             if lo > hi:
@@ -1874,7 +1882,7 @@ class App:
             return fn(cfg, self.data)
         except SystemExit as e:
             raise ValueError(str(e.code or e))
-        except Exception as e:      # кривые «Свои условия» и т.п. — показать, а не молча упасть
+        except Exception as e:  # noqa: BLE001 — кривые «Свои условия» и т.п.: показать, а не упасть
             raise ValueError("не удалось разобрать конфиг: %s: %s" % (type(e).__name__, e))
 
     @staticmethod
@@ -1920,17 +1928,18 @@ class App:
                 lbl.config(text="ошибка", fg=MINUS)
         self._left_gen += 1
         cfg, err = self.build_cfg()
-        if not err:
+        total, entries = 0, []
+        if cfg is not None:
             try:
                 total = self._gbt(gbt.count_jobs, cfg)
-                entries = self._gbt(lambda c, d: gbt.entry_variants(c, d, cfg["positions"][0]), cfg)
+                entries = self._gbt(lambda c, d: gbt.entry_variants(c, d, c["positions"][0]), cfg)
                 if total == 0 and entries:
                     err = ("0 прогонов: ни у одной выбранной пары нет истории за этот период — "
                            "выберите другие даты или «лет»")
             except ValueError as e:
                 err = str(e)
-        if err:
-            self.err.config(text=err)
+        if err or cfg is None:
+            self.err.config(text=err or "")
             self.total_lbl.config(text="—")
             self.parts_lbl.config(text="")
             self.eta_lbl.config(text="")
@@ -1978,7 +1987,7 @@ class App:
         try:
             jobs = gbt.build_jobs(cfg, self.data)
             left = self._left(cfg, jobs)
-        except (SystemExit, Exception):
+        except (SystemExit, Exception):  # noqa: BLE001 — фоновый подсчёт: не вышло — счётчик без «осталось»
             return
         self.q.put(("left", (gen, cfg, total, left)))
 
@@ -2012,7 +2021,7 @@ class App:
         if self.proc:
             return
         cfg, err = self.build_cfg()
-        if err:
+        if cfg is None:
             messagebox.showerror("Настройки", err)
             return
         try:
@@ -2105,7 +2114,7 @@ class App:
             return
         try:
             self._apply_cfg(cfg)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — чужой конфиг любого вида: сказать, а не упасть
             messagebox.showerror("Конфиг", "Не перенёс в форму: %s" % e)
             return
         self.say("Конфиг загружен: %s" % path, "ok")
@@ -2138,8 +2147,8 @@ class App:
                 self.years.set([y])
             else:
                 self.years.set([])
-                self.date_from.set(spec.get("from", ""))
-                self.date_to.set(spec.get("to", ""))
+                self.date_from.set(str(spec.get("from", "")))
+                self.date_to.set(str(spec.get("to", "")))
             self.extra_periods.set(json.dumps(periods[1:], ensure_ascii=False) if len(periods) > 1 else "")
 
             # как в gbt.py: без entries — "none", а если есть indicators — только они
@@ -2287,7 +2296,7 @@ class App:
         if not self.proc:
             return
         proc = self.proc
-        if self.stopping or self.proc_args[0] != "sweep":
+        if self.stopping or (self.proc_args or [""])[0] != "sweep":
             # повторное нажатие или не прогон (вход, топ) — снять сразу
             self.stopping = True
             self.say("Останавливаю…", "err")

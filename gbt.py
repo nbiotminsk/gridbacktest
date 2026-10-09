@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: UP031 — строки форматируются через %, как во всём проекте
 """Массовый прогон бэктестов gridbacktest.com.
 
   python gbt.py login                    вход через Telegram, сессия -> data/session.json
@@ -98,7 +99,8 @@ CSV_COLS = (["key", "symbol", "position", "from", "to", "months", "entry", "entr
             + list(RESULT_COLS.values()) + STOP_COLS + ["seconds", "error"])
 
 if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)  # лог в файл — построчно
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace",  # type: ignore[attr-defined]
+                           line_buffering=True)  # лог в файл — построчно
 
 
 # ---------- сессия ----------
@@ -151,7 +153,7 @@ def cmd_login(_args):
         print("Если бот не отвечает — запасной:\n  %s\n" % out["backup"])
     try:
         webbrowser.open(out["link"])
-    except Exception:
+    except Exception:   # noqa: BLE001, S110 — браузер не открылся: ссылка уже напечатана выше
         pass
     print("Ждём подтверждения (до 2 минут)…")
     deadline = time.time() + 125
@@ -210,10 +212,11 @@ def cmd_info(_args):
     print("\nИндикаторы для своих правил (indicators): id, параметры по умолчанию, норма long | short")
     for c in d["catalog"]:
         n = d["norms"].get(c["id"], {})
-        side = lambda k: ("%s %s" % (n[k]["op"], n[k].get("value", "")) if k in n else "")
+        long_, short_ = (("%s %s" % (n[k]["op"], n[k].get("value", "")) if k in n else "")
+                         for k in ("long", "short"))
         print("  %-12s %-34s %-40s %s | %s" % (
             c["id"], c["name"], json.dumps(c.get("defaults", {}), ensure_ascii=False),
-            side("long"), side("short")))
+            long_, short_))
         if c.get("lines"):
             print("  %-12s line: %s" % ("", ", ".join(c["lines"])))
     lim = d["entry_limits"]
@@ -674,7 +677,7 @@ def stop_eval(sd, p, stop_pct):
             adds = [p_open * (1 - offs[i] / 100) if long else p_open * (1 + offs[i] / 100)
                     for i in range(1, min(adds, len(offs) - 1) + 1)]
         q = c = 0.0
-        stop = None
+        stop = 0.0                      # задаётся на первом шаге (вход), раньше не читается
         hit = False
         for i, pr in enumerate([p_open] + adds):
             if i and crossed(pr, stop):
@@ -1050,113 +1053,114 @@ def cmd_sweep(args):
 
     upgrade_csv(out_csv)
     new_file = not os.path.exists(out_csv)
-    fcsv = open(out_csv, "a", encoding="utf-8-sig" if new_file else "utf-8", newline="")
-    w = csv.DictWriter(fcsv, fieldnames=CSV_COLS, extrasaction="ignore")
-    if new_file:
-        w.writeheader()
-    for (key, req, row), need, out in local:
-        w.writerows(result_rows(row, out, need))
-    fcsv.flush()
+    n = errors = 0
+    with open(out_csv, "a", encoding="utf-8-sig" if new_file else "utf-8", newline="") as fcsv:
+        w = csv.DictWriter(fcsv, fieldnames=CSV_COLS, extrasaction="ignore")
+        if new_file:
+            w.writeheader()
+        for (key, req, row), need, out in local:
+            w.writerows(result_rows(row, out, need))
+        fcsv.flush()
+        if todo:
+            n, errors = sweep_server(args, cfg, s, todo, w, fcsv, out_jsonl)
     if not todo:
-        fcsv.close()
         print("Готово: пересчитан стоп для %d прогонов. Результаты: %s" % (len(local), out_csv))
         show_top(out_csv, 15)
         return
+    print("Готово: %d прогонов, ошибок %d. Результаты: %s" % (n, errors, out_csv))
+    if n or local:
+        show_top(out_csv, 15)
 
+
+def sweep_server(args, cfg, s, todo, w, fcsv, out_jsonl):
+    """Прогоны на сервере: каждая строка сразу в CSV (w / fcsv) и ответ в .jsonl.
+    -> (сколько посчитано, сколько с ошибкой)."""
     me = get_me(s, fresh=True)
     if me.get("bots") != "active":
         print_me(me)
-        fcsv.close()
         if not args.force:
             sys.exit("Остановлено. (--force — считать всё равно, итоги будут нулями)")
         global ALLOW_LOCKED
         ALLOW_LOCKED = True
-        fcsv = open(out_csv, "a", encoding="utf-8", newline="")
-        w = csv.DictWriter(fcsv, fieldnames=CSV_COLS, extrasaction="ignore")
 
     workers = max(1, int(args.workers or cfg.get("workers", 2)))
-    fjs = open(out_jsonl, "a", encoding="utf-8")
+    with open(out_jsonl, "a", encoding="utf-8") as fjs:
+        started, n, errors = time.time(), 0, 0
+        pending = {}
+        it = iter(todo)
 
-    started, n, errors = time.time(), 0, 0
-    pending = {}
-    it = iter(todo)
+        def submit(pool):
+            item = None if STOP.is_set() else next(it, None)
+            if item is None:
+                return False
+            pending[pool.submit(run_one, s, item[0][1])] = item
+            return True
 
-    def submit(pool):
-        item = None if STOP.is_set() else next(it, None)
-        if item is None:
-            return False
-        pending[pool.submit(run_one, s, item[0][1])] = item
-        return True
+        stop_file = os.environ.get("GBT_STOP_FILE")   # GUI создаёт этот файл по кнопке «Стоп»
+        if stop_file:
+            def watch_stop():
+                while not STOP.wait(0.5):
+                    if os.path.exists(stop_file):
+                        STOP.set()
+            threading.Thread(target=watch_stop, daemon=True).start()
 
-    stop_file = os.environ.get("GBT_STOP_FILE")   # GUI создаёт этот файл по кнопке «Стоп»
-    if stop_file:
-        def watch_stop():
-            while not STOP.wait(0.5):
-                if os.path.exists(stop_file):
-                    STOP.set()
-        threading.Thread(target=watch_stop, daemon=True).start()
-
-    pool = ThreadPoolExecutor(max_workers=workers)
-    try:
-        for _ in range(workers * 2):
-            if not submit(pool):
-                break
-        while pending:
-            # с таймаутом: иначе на Windows Ctrl+C не прерывает ожидание
-            finished, _ = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
-            # сначала записать готовые итоги, потом — исключения (Stop), чтобы не терять посчитанное
-            for fut in sorted(finished, key=lambda f: f.exception() is not None):
-                (key, req, row), need = pending.pop(fut)
-                out, err = fut.result()        # Stop пробрасывается наружу
-                if out:
-                    out = dict(out)
-                    out["stopdata"] = stop_data(out)   # сделки — чтобы менять стоп без сервера
-                    rows = result_rows(row, out, need)
-                    slim = {k: v for k, v in out.items()
-                            if k not in ("candles", "marks", "deals", "bot")}
-                    fjs.write(json.dumps({"key": key, "request": req, "result": slim},
-                                         ensure_ascii=False) + "\n")
-                else:
-                    rows = [dict(row, stop_loss=stop_str(st), error=err) for st in need]
-                    errors += 1
-                w.writerows(rows)
-                fcsv.flush()
-                fjs.flush()
-                n += 1
-                el = time.time() - started
-                eta = el / n * (len(todo) - n)
-                row = rows[0]
-                # итог — в начале строки: в узком журнале GUI он виден без прокрутки
-                tag = ("ОШИБКА " + err) if err else "итог %+.2f%% просадка %s%%%s" % (
-                    row.get("net_pct") or 0, row.get("max_drawdown"),
-                    " ЛИКВИДАЦИЯ %s" % (row.get("liq_time") or "") if row.get("liquidated") else "")
-                for r in rows:
-                    if r.get("stop_hits") not in (None, ""):
-                        tag += " | стоп %s%%: %s%s, итог %+.2f%%%s" % (
-                            r["stop_loss"], r["stop_hits"],
-                            " (+%s?)" % r["stop_maybe"] if r["stop_maybe"] else "",
-                            r["net_stop_pct"],
-                            " (неполный: стоп до ликвидации, дальше сервер не считал)"
-                            if r["liq_avoided"] else "")
-                print("[%d/%d] %s | %s %s ov%s ord%s pf%s vf%s tp%s | %s | ETA %dм"
-                      % (n, len(todo), tag, row["symbol"], row["position"], row["price_overlap"],
-                         row["orders"], row["price_factor"], row["volume_factor"], row["profit"],
-                         entry_name(row), eta // 60))
-                submit(pool)
-            if STOP.is_set():
-                raise Stop("остановлено по запросу")
-    except Stop as e:
-        print("\nОстановлено: %s. Запустите ту же команду снова — продолжит с места остановки." % e)
-    except KeyboardInterrupt:
-        print("\nПрервано. Запустите ту же команду снова — продолжит с места остановки.")
-    finally:
-        STOP.set()   # потоки, ждущие лимит, сразу выходят — иначе процесс не завершится
-        pool.shutdown(wait=False, cancel_futures=True)
-        fcsv.close()
-        fjs.close()
-    print("Готово: %d прогонов, ошибок %d. Результаты: %s" % (n, errors, out_csv))
-    if n or local:
-        show_top(out_csv, 15)
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
+            for _ in range(workers * 2):
+                if not submit(pool):
+                    break
+            while pending:
+                # с таймаутом: иначе на Windows Ctrl+C не прерывает ожидание
+                finished, _ = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
+                # сначала записать готовые итоги, потом — исключения (Stop), чтобы не терять посчитанное
+                for fut in sorted(finished, key=lambda f: f.exception() is not None):
+                    (key, req, row), need = pending.pop(fut)
+                    out, err = fut.result()        # Stop пробрасывается наружу
+                    if out:
+                        out = dict(out)
+                        out["stopdata"] = stop_data(out)   # сделки — чтобы менять стоп без сервера
+                        rows = result_rows(row, out, need)
+                        slim = {k: v for k, v in out.items()
+                                if k not in ("candles", "marks", "deals", "bot")}
+                        fjs.write(json.dumps({"key": key, "request": req, "result": slim},
+                                             ensure_ascii=False) + "\n")
+                    else:
+                        rows = [dict(row, stop_loss=stop_str(st), error=err) for st in need]
+                        errors += 1
+                    w.writerows(rows)
+                    fcsv.flush()
+                    fjs.flush()
+                    n += 1
+                    el = time.time() - started
+                    eta = el / n * (len(todo) - n)
+                    row = rows[0]
+                    # итог — в начале строки: в узком журнале GUI он виден без прокрутки
+                    tag = ("ОШИБКА " + err) if err else "итог %+.2f%% просадка %s%%%s" % (
+                        row.get("net_pct") or 0, row.get("max_drawdown"),
+                        " ЛИКВИДАЦИЯ %s" % (row.get("liq_time") or "") if row.get("liquidated") else "")
+                    for r in rows:
+                        if r.get("stop_hits") not in (None, ""):
+                            tag += " | стоп %s%%: %s%s, итог %+.2f%%%s" % (
+                                r["stop_loss"], r["stop_hits"],
+                                " (+%s?)" % r["stop_maybe"] if r["stop_maybe"] else "",
+                                r["net_stop_pct"],
+                                " (неполный: стоп до ликвидации, дальше сервер не считал)"
+                                if r["liq_avoided"] else "")
+                    print("[%d/%d] %s | %s %s ov%s ord%s pf%s vf%s tp%s | %s | ETA %dм"
+                          % (n, len(todo), tag, row["symbol"], row["position"], row["price_overlap"],
+                             row["orders"], row["price_factor"], row["volume_factor"], row["profit"],
+                             entry_name(row), eta // 60))
+                    submit(pool)
+                if STOP.is_set():
+                    raise Stop("остановлено по запросу")
+        except Stop as e:
+            print("\nОстановлено: %s. Запустите ту же команду снова — продолжит с места остановки." % e)
+        except KeyboardInterrupt:
+            print("\nПрервано. Запустите ту же команду снова — продолжит с места остановки.")
+        finally:
+            STOP.set()   # потоки, ждущие лимит, сразу выходят — иначе процесс не завершится
+            pool.shutdown(wait=False, cancel_futures=True)
+    return n, errors
 
 
 # ---------- отчёт ----------
@@ -1327,8 +1331,8 @@ def ask_results():
 
 
 def sweep_args(config, **kw):
-    return argparse.Namespace(**dict(dict(config=config, out=None, workers=None,
-                                          dry_run=False, force=False), **kw))
+    return argparse.Namespace(**{"config": config, "out": None, "workers": None,
+                                 "dry_run": False, "force": False, **kw})
 
 
 def menu_action(ch):
@@ -1385,7 +1389,7 @@ def cmd_menu(_args):
         except KeyboardInterrupt:
             print("\nПрервано.")
             shown = True
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — меню не должно падать: ошибку показать и вернуться
             print("Ошибка: %s" % e)
             shown = True
         if shown:
